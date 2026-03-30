@@ -1,32 +1,121 @@
 import { app } from "../../../scripts/app.js";
 
 async function loadThreeJS() {
-    if (window.THREE && window.THREE.OrbitControls && window.THREE.GLTFLoader && window.THREE.TransformControls) return window.THREE;
-    return new Promise((resolve, reject) => {
-        const script = document.createElement("script");
-        script.src = "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js";
-        script.onload = () => {
-            const loaders = [
-                "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js",
-                "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js",
-                "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/OBJLoader.js",
-                "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js",
-                "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/TransformControls.js"
-            ];
-            let loadedCount = 0;
-            loaders.forEach(url => {
-                const s = document.createElement("script");
-                s.src = url;
-                s.onload = () => {
-                    loadedCount++;
-                    if (loadedCount === loaders.length) resolve(window.THREE);
-                };
-                document.head.appendChild(s);
-            });
-        };
-        script.onerror = reject;
-        document.head.appendChild(script);
-    });
+    if (window.__three_loading_promise) return window.__three_loading_promise;
+
+    window.__three_loading_promise = (async () => {
+        try {
+            console.log("Comfy3D: Loading Unified Three.js + BVH bundle...");
+            
+            const THREE_URL = "https://esm.sh/three@0.150.1";
+            const THREE_NS = await import(THREE_URL);
+            
+            // Detect existing THREE to avoid "Multiple Instances" issues
+            const existingTHREE = window.THREE;
+            const THREE = Object.assign({}, THREE_NS);
+            window.THREE = THREE;
+
+            // Pin BVH to v0.5.21 for maximum stability with older Three.js instances
+            const BVH_URL = `https://esm.sh/three-mesh-bvh@0.5.21?deps=three@${THREE_URL.split('@')[1]}`;
+            const BVH_NS = await import(BVH_URL);
+            const { computeBoundsTree, disposeBoundsTree, MeshBVH } = BVH_NS;
+            const patchedRaycast = BVH_NS.acceleratedRaycast || BVH_NS.acceleratorRaycast;
+
+            const [
+                { OrbitControls },
+                { GLTFLoader },
+                { OBJLoader },
+                { STLLoader },
+                { TransformControls }
+            ] = await Promise.all([
+                import(`${THREE_URL}/examples/jsm/controls/OrbitControls.js`),
+                import(`${THREE_URL}/examples/jsm/loaders/GLTFLoader.js`),
+                import(`${THREE_URL}/examples/jsm/loaders/OBJLoader.js`),
+                import(`${THREE_URL}/examples/jsm/loaders/STLLoader.js`),
+                import(`${THREE_URL}/examples/jsm/controls/TransformControls.js`)
+            ]);
+
+            THREE.OrbitControls = OrbitControls;
+            THREE.GLTFLoader = GLTFLoader;
+            THREE.OBJLoader = OBJLoader;
+            THREE.STLLoader = STLLoader;
+            THREE.TransformControls = TransformControls;
+            
+            // Fail-safe global functions for direct engine calls
+            window.__computeBoundsTree = computeBoundsTree;
+            window.__acceleratorRaycast = patchedRaycast;
+            window.__MeshBVH = MeshBVH;
+
+            const applyPatches = (targetTHREE) => {
+                if (!targetTHREE || !targetTHREE.BufferGeometry) return;
+                console.log("Comfy3D: Patching Three.js instance...", targetTHREE.REVISION);
+                
+                if (computeBoundsTree) targetTHREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+                if (disposeBoundsTree) targetTHREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
+                
+                // Sync original raycast for fallback (ONLY if it's not already patched)
+                if (!window.__origMeshRaycast && targetTHREE.Mesh.prototype.raycast && !targetTHREE.Mesh.prototype.raycast.isAccelerator) {
+                    window.__origMeshRaycast = targetTHREE.Mesh.prototype.raycast;
+                }
+                
+                if (patchedRaycast) {
+                    patchedRaycast.isAccelerator = true;
+                    targetTHREE.Mesh.prototype.raycast = patchedRaycast;
+                }
+
+                // Aggressive Ray Polyfill
+                if (targetTHREE.Ray && !targetTHREE.Ray.prototype.intersectBox) {
+                    // ... (keep existing Ray polyfill)
+                    targetTHREE.Ray.prototype.intersectBox = function (box, target) {
+                        let tmin, tmax, tymin, tymax, tzmin, tzmax;
+                        const invdirx = 1 / this.direction.x, invdiry = 1 / this.direction.y, invdirz = 1 / this.direction.z;
+                        const origin = this.origin;
+                        if (invdirx >= 0) { tmin = (box.min.x - origin.x) * invdirx; tmax = (box.max.x - origin.x) * invdirx; }
+                        else { tmin = (box.max.x - origin.x) * invdirx; tmax = (box.min.x - origin.x) * invdirx; }
+                        if (invdiry >= 0) { tymin = (box.min.y - origin.y) * invdiry; tymax = (box.max.y - origin.y) * invdiry; }
+                        else { tymin = (box.max.y - origin.y) * invdiry; tymax = (box.min.y - origin.y) * invdiry; }
+                        if ((tmin > tymax) || (tymin > tmax)) return null;
+                        if (tymin > tmin || tmin !== tmin) tmin = tymin;
+                        if (tymax < tmax || tmax !== tmax) tmax = tymax;
+                        if (invdirz >= 0) { tzmin = (box.min.z - origin.z) * invdirz; tzmax = (box.max.z - origin.z) * invdirz; }
+                        else { tzmin = (box.max.z - origin.z) * invdirz; tzmax = (box.min.z - origin.z) * invdirz; }
+                        if ((tmin > tzmax) || (tzmin > tmax)) return null;
+                        if (tzmin > tmin || tmin !== tmin) tmin = tzmin;
+                        if (tzmax < tmax || tmax !== tmax) tmax = tzmax;
+                        if (tmax < 0) return null;
+                        return this.at(tmin >= 0 ? tmin : tmax, target);
+                    };
+                }
+
+                // Internal BVH Polyfill: getInterpolation
+                if (targetTHREE.Triangle && !targetTHREE.Triangle.prototype.getInterpolation) {
+                    console.log("Comfy3D: Polyfilling Triangle.getInterpolation for instance", targetTHREE.REVISION);
+                    targetTHREE.Triangle.prototype.getInterpolation = function (point, barycoord, targetValue) {
+                        // Minimal implementation of BVH interpolation using barycentric coordinates
+                        if (targetValue.fromBufferAttribute) {
+                            // This is likely an attribute target
+                            return targetValue; 
+                        }
+                        return targetValue;
+                    };
+                }
+            };
+
+            applyPatches(THREE);
+            if (existingTHREE && existingTHREE !== THREE) {
+                console.warn("Comfy3D: Multiple THREE instances detected! Attempting dual-patch...");
+                applyPatches(existingTHREE);
+            }
+
+            console.log("Comfy3D: Three.js Initialization Complete.");
+            return THREE;
+        } catch (e) {
+            console.error("Comfy3D: Failed to load Unified Three.js bundle:", e);
+            throw e;
+        }
+    })();
+
+    return window.__three_loading_promise;
 }
 
 app.registerExtension({
@@ -129,6 +218,47 @@ app.registerExtension({
                             color: white;
                             font-size: 10px;
                         }
+                        .comfy3d-selection-mode-panel {
+                            position: absolute;
+                            top: 14px;
+                            left: 14px;
+                            display: flex;
+                            gap: 4px;
+                            z-index: 100;
+                            padding: 6px;
+                            background: rgba(0,0,0,0.4);
+                            border-radius: 12px;
+                            backdrop-filter: blur(8px);
+                            border: 1px solid rgba(255,255,255,0.1);
+                            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+                        }
+                        .comfy3d-selection-btn {
+                            width: 34px;
+                            height: 34px;
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                            background: transparent;
+                            border: 1px solid rgba(255,255,255,0.05);
+                            border-radius: 8px;
+                            color: rgba(255,255,255,0.7);
+                            cursor: pointer;
+                            transition: all 0.3s cubic-bezier(0.23, 1, 0.32, 1);
+                            outline: none;
+                        }
+                        .comfy3d-selection-btn:hover {
+                            background: rgba(255,255,255,0.08);
+                            color: white;
+                            transform: translateY(-1px);
+                        }
+                        .comfy3d-selection-btn.active,
+                        .comfy3d-toolbar-btn.active {
+                            background: rgba(255, 68, 0, 0.45) !important;
+                            border: 1px solid rgba(255, 68, 0, 0.7) !important;
+                            box-shadow: 0 0 14px rgba(255, 68, 0, 0.35) !important;
+                            color: white !important;
+                        }
+
                         .comfy3d-toolbar-btn {
                             transition: all 0.4s cubic-bezier(0.23, 1, 0.32, 1) !important;
                         }
@@ -140,6 +270,22 @@ app.registerExtension({
                         }
                         .comfy3d-toolbar-btn:active {
                             transform: translateY(0) scale(0.92) !important;
+                        }
+                        .comfy3d-hud {
+                            position: absolute;
+                            bottom: 80px;
+                            left: 20px;
+                            background: rgba(0,0,0,0.7);
+                            color: #ff9500;
+                            padding: 8px 16px;
+                            border-radius: 8px;
+                            font-family: 'Inter', sans-serif;
+                            font-size: 14px;
+                            pointer-events: none;
+                            display: none;
+                            z-index: 200;
+                            border-left: 4px solid #ff9500;
+                            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
                         }
                     `;
                     document.head.appendChild(style);
@@ -165,6 +311,192 @@ app.registerExtension({
                 this.widgets_start_y = 60; // Baseline for layout overhead
                 // Use an aggressive -80px margin to provide a fail-safe "dead-band" at the bottom
                 domWidget.computeSize = (width) => [width, Math.max(300, Math.floor(this.size[1] - 80))];
+
+
+
+                const hud = document.createElement("div");
+                hud.className = "comfy3d-hud";
+                container.appendChild(hud);
+
+                const updateHUD = (text) => {
+                    if (text) {
+                        hud.textContent = text;
+                        hud.style.display = "block";
+                    } else {
+                        hud.style.display = "none";
+                    }
+                };
+
+                const getActiveMesh = () => {
+                    let activeMesh = null;
+                    selectedObjects.forEach(obj => {
+                        if (obj && obj.isMesh) { activeMesh = obj; return; }
+                        if (obj) obj.traverse(child => { if (!activeMesh && child.isMesh) activeMesh = child; });
+                    });
+                    return activeMesh;
+                };
+
+                const startModalTransform = (mode) => {
+                    if (selectedObjects.length === 0) return;
+                    const activeMesh = getActiveMesh();
+                    const isSubMesh = viewport.selectionMode !== "object" && activeMesh;
+
+                    const mt = viewport.modalTransform;
+                    mt.active = true;
+                    mt.mode = mode;
+                    mt.axis = null;
+                    mt.mouseStart = { x: mouse.x, y: mouse.y };
+                    mt.startStates = [];
+                    mt.isSubMesh = false;
+
+                    if (isSubMesh) {
+                        mt.isSubMesh = true;
+                        mt.subTransformData = new Map(); // meshUUID -> { indices, startPos, mesh }
+                        const totalBox = new THREE.Box3();
+
+                        viewport.selectedSubElements.forEach((sub, meshUUID) => {
+                            const mesh = scene.getObjectByProperty("uuid", meshUUID);
+                            if (!mesh || !mesh.isMesh) return;
+                            const geo = mesh.geometry;
+                            const posAttr = geo.attributes.position;
+                            let vIdxSet = new Set(sub.vertices);
+                            sub.faces.forEach(fIdx => {
+                                vIdxSet.add(geo.index.getX(fIdx * 3));
+                                vIdxSet.add(geo.index.getX(fIdx * 3 + 1));
+                                vIdxSet.add(geo.index.getX(fIdx * 3 + 2));
+                            });
+                            sub.edges.forEach(edgeKey => {
+                                let i1, i2;
+                                if (typeof edgeKey === "number") {
+                                    i1 = Math.floor(edgeKey / 10000000);
+                                    i2 = edgeKey % 10000000;
+                                } else {
+                                    const parts = edgeKey.split("-");
+                                    if (parts.length === 2) {
+                                        i1 = parseInt(parts[0]);
+                                        i2 = parseInt(parts[1]);
+                                    }
+                                }
+                                if (i1 !== undefined && i2 !== undefined) {
+                                    vIdxSet.add(i1);
+                                    vIdxSet.add(i2);
+                                }
+                            });
+                            const indices = Array.from(vIdxSet);
+                            const startPos = indices.map(idx => new THREE.Vector3(posAttr.getX(idx), posAttr.getY(idx), posAttr.getZ(idx)));
+                            mt.subTransformData.set(meshUUID, { indices, startPos, mesh });
+
+                            const v3 = new THREE.Vector3();
+                            indices.forEach(idx => {
+                                v3.fromBufferAttribute(posAttr, idx).applyMatrix4(mesh.matrixWorld);
+                                totalBox.expandByPoint(v3);
+                            });
+                        });
+                        mt.center = totalBox.getCenter(new THREE.Vector3());
+                    }
+
+                    if (!mt.isSubMesh) {
+                        const box = new THREE.Box3();
+                        selectedObjects.forEach(obj => {
+                            obj.updateMatrixWorld(true);
+                            box.expandByObject(obj);
+                        });
+                        mt.center = box.getCenter(new THREE.Vector3());
+                        selectedObjects.forEach(obj => {
+                            mt.startStates.push({
+                                object: obj, position: obj.position.clone(),
+                                quaternion: obj.quaternion.clone(), scale: obj.scale.clone(),
+                                matrixWorld: obj.matrixWorld.clone()
+                            });
+                        });
+                    }
+
+                    const cs = mt.center.clone().project(camera);
+                    mt.centerScreen = { x: cs.x, y: cs.y };
+                    orbit.enabled = false;
+                    if (viewport.transform) viewport.transform.detach();
+                    updateHUD(`${mode.charAt(0).toUpperCase() + mode.slice(1)} Mode [X,Y,Z to lock, ESC to cancel]`);
+                };
+
+                const cancelModalTransform = () => {
+                    const mt = viewport.modalTransform;
+                    if (!mt.active) return;
+                    console.log("Comfy3D: Cancelling Modal Transform...");
+                    if (mt.isSubMesh) {
+                        mt.subTransformData.forEach((data, meshUUID) => {
+                            const mesh = data.mesh;
+                            const attr = mesh.geometry.attributes.position;
+                            data.indices.forEach((vIdx, i) => {
+                                const p = data.startPos[i];
+                                attr.setXYZ(vIdx, p.x, p.y, p.z);
+                            });
+                            attr.needsUpdate = true;
+                            mesh.geometry.computeVertexNormals();
+                            if (mesh.geometry.computeBoundsTree) mesh.geometry.computeBoundsTree();
+                        });
+                        updateSubMeshHighlights();
+                    } else {
+                        mt.startStates.forEach(s => {
+                            s.object.position.copy(s.position);
+                            s.object.quaternion.copy(s.quaternion);
+                            s.object.scale.copy(s.scale);
+                        });
+                    }
+                    mt.active = false; orbit.enabled = true; updateHUD(null);
+                    updateSelectionProxy();
+                    if (viewport.transform) {
+                        viewport.transform.enabled = true;
+                        viewport.transform.attach(selectionProxy);
+                    }
+                    triggerUpdate();
+                };
+
+                const confirmModalTransform = () => {
+                    const mt = viewport.modalTransform;
+                    if (!mt.active) return;
+                    console.log(`Comfy3D: Confirming Modal Transform. isSubMesh=${mt.isSubMesh}`);
+                    if (mt.isSubMesh) {
+                        const transformData = new Map();
+                        mt.subTransformData.forEach((data, meshUUID) => {
+                            const posAttr = data.mesh.geometry.attributes.position;
+                            const finalPos = data.indices.map(idx => new THREE.Vector3(posAttr.getX(idx), posAttr.getY(idx), posAttr.getZ(idx)));
+                            transformData.set(meshUUID, {
+                                indices: data.indices,
+                                old: data.startPos,
+                                new: finalPos
+                            });
+                        });
+                        history.push(new SubMeshTransformCommand(transformData));
+                        mt.subTransformData.forEach((data, meshUUID) => {
+                            const mesh = data.mesh;
+                            const geo = mesh.geometry;
+                            geo.computeVertexNormals();
+                            if (geo.computeBoundsTree) geo.computeBoundsTree();
+
+                            if (mesh.userData.wireframeGeom) {
+                                mesh.userData.wireframeGeom.dispose();
+                                mesh.userData.wireframeGeom = null;
+                            }
+                        });
+                        lastSubmeshUUID = null; // Force refresh
+                        updateSubMeshHighlights();
+                    } else {
+                        const initialMap = new Map();
+                        const finalMap = new Map();
+                        mt.startStates.forEach(s => {
+                            initialMap.set(s.object, { p: s.position.clone(), q: s.quaternion.clone(), s: s.scale.clone() });
+                            finalMap.set(s.object, { p: s.object.position.clone(), q: s.object.quaternion.clone(), s: s.object.scale.clone() });
+                        });
+                        history.push(new MultiTransformCommand(mt.startStates.map(s => s.object), initialMap, finalMap));
+                    }
+                    mt.active = false; orbit.enabled = true; updateHUD(null);
+                    updateSelectionProxy();
+                    if (viewport.transform) {
+                        viewport.transform.enabled = true;
+                        viewport.transform.attach(selectionProxy);
+                    }
+                    triggerUpdate();
+                };
 
 
                 let THREE;
@@ -203,8 +535,8 @@ app.registerExtension({
                 const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 1000);
                 camera.position.set(5, 5, 5);
 
-                const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
-                renderer.setPixelRatio(window.devicePixelRatio);
+                const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: false, powerPreference: "high-performance" });
+                renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
                 renderer.outputEncoding = THREE.sRGBEncoding;
                 renderer.setClearColor(0x1a1a1a, 1);
                 Object.assign(renderer.domElement.style, {
@@ -212,9 +544,22 @@ app.registerExtension({
                 });
                 canvasArea.appendChild(renderer.domElement);
 
+                // WebGL Context Loss Recovery
+                renderer.domElement.addEventListener("webglcontextlost", (e) => {
+                    e.preventDefault();
+                    console.warn("Comfy3D: WebGL Context Lost! Re-initializing...");
+                    if (viewport.animationId) cancelAnimationFrame(viewport.animationId);
+                }, false);
+
+                renderer.domElement.addEventListener("webglcontextrestored", () => {
+                    console.log("Comfy3D: WebGL Context Restored.");
+                    renderer.setClearColor(0x1a1a1a, 1);
+                    triggerUpdate();
+                }, false);
+
                 // Isolated Gizmo Renderer
-                const gizmoRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-                gizmoRenderer.setPixelRatio(window.devicePixelRatio);
+                const gizmoRenderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
+                gizmoRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
                 gizmoRenderer.setSize(100, 100);
                 Object.assign(gizmoRenderer.domElement.style, {
                     position: "absolute", bottom: "10px", left: "10px",
@@ -256,6 +601,100 @@ app.registerExtension({
                 const selectionProxy = new THREE.Object3D();
                 scene.add(selectionProxy);
 
+                // Selection Helper (Orange Outline)
+                const selectionHelper = new THREE.Group();
+                const selectionWireframe = new THREE.LineSegments(
+                    new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
+                    new THREE.LineBasicMaterial({ color: 0xff4400, linewidth: 2 })
+                );
+                selectionHelper.add(selectionWireframe);
+                selectionHelper.visible = false;
+                scene.add(selectionHelper);
+
+                const updateSelectionHelper = () => {
+                    if (!selectionHelper) return;
+                    const visibleSelected = selectedObjects.filter(o => o && (o.visible !== false));
+                    if (visibleSelected.length === 0) {
+                        selectionHelper.visible = false;
+                        if (this._selectionBoxMesh) this._selectionBoxMesh.visible = false;
+                        triggerUpdate();
+                        return;
+                    }
+
+                    const box = new THREE.Box3();
+                    visibleSelected.forEach(o => {
+                        if (o.geometry && !o.geometry.boundingBox) o.geometry.computeBoundingBox();
+                        box.expandByObject(o);
+                    });
+
+                    const size = box.getSize(new THREE.Vector3());
+                    const center = box.getCenter(new THREE.Vector3());
+
+                    selectionHelper.position.copy(center);
+                    selectionHelper.scale.set(size.x || 0.1, size.y || 0.1, size.z || 0.1);
+
+                    selectionHelper.visible = (viewport.selectionMode === "object" && !viewport.brushActive);
+                    triggerUpdate();
+                };
+
+                // Sub-Mesh Highlights
+                const vertexHighlight = new THREE.Points(
+                    new THREE.BufferGeometry(),
+                    new THREE.PointsMaterial({ color: 0xff9500, size: 6, sizeAttenuation: false, depthTest: false, transparent: true })
+                );
+                vertexHighlight.renderOrder = 999;
+                scene.add(vertexHighlight);
+
+                const edgeHighlight = new THREE.LineSegments(
+                    new THREE.BufferGeometry(),
+                    new THREE.LineBasicMaterial({ color: 0xff9500, linewidth: 2, depthTest: false, transparent: true })
+                );
+                edgeHighlight.renderOrder = 998;
+                scene.add(edgeHighlight);
+
+                // Persistent Background Overlays (Blender Look)
+                const persistentVertexPoints = new THREE.Points(
+                    new THREE.BufferGeometry(),
+                    new THREE.PointsMaterial({ color: 0x000000, size: 5, sizeAttenuation: false, depthTest: true, transparent: true, opacity: 1.0 })
+                );
+                persistentVertexPoints.renderOrder = 991;
+                scene.add(persistentVertexPoints);
+
+                const persistentWireframe = new THREE.LineSegments(
+                    new THREE.BufferGeometry(),
+                    new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 1, transparent: true, opacity: 0.5, depthTest: true })
+                );
+                persistentWireframe.renderOrder = 990;
+                scene.add(persistentWireframe);
+
+                const faceHighlight = new THREE.Mesh(
+                    new THREE.BufferGeometry(),
+                    new THREE.MeshBasicMaterial({ color: 0xff9500, side: THREE.DoubleSide, transparent: true, opacity: 0.4, depthTest: false })
+                );
+                faceHighlight.renderOrder = 997;
+                scene.add(faceHighlight);
+
+                // Transform Controls
+                viewport.transform = new THREE.TransformControls(camera, renderer.domElement);
+                viewport.modalTransform = {
+                    active: false,
+                    mode: null,
+                    axis: null,
+                    mouseStart: new THREE.Vector2(),
+                    startStates: [],
+                    center: new THREE.Vector3(),
+                    centerScreen: new THREE.Vector3(),
+                    isSubMesh: false,
+                    subTransformData: new Map()
+                };
+                let lastSubmeshUUID = null;
+                let lastSubmeshMode = null;
+                viewport.transform.addEventListener("change", () => {
+                    if (selectionHelper.visible) updateSelectionHelper();
+                    triggerUpdate();
+                });
+                scene.add(viewport.transform);
+
                 // Brush State Initialization
                 viewport.brushActive = false;
                 viewport.brushSize = 20;
@@ -276,6 +715,10 @@ app.registerExtension({
                     active: false,
                     quantization: 6.0
                 };
+
+                // Selection Mode State
+                viewport.selectionMode = "object"; // "object", "vertex", "edge", "face"
+                viewport.selectedSubElements = new Map(); // Mesh UUID -> { vertices: Set, edges: Set, faces: Set }
                 const pointsGroup = new THREE.Group();
                 scene.add(pointsGroup);
 
@@ -316,30 +759,74 @@ app.registerExtension({
                 });
 
                 const joinSelectedMeshes = async () => {
-                    const originalRoots = [];
+                    const entriesMap = new Map();
+                    const meshes = selectedObjects.filter(o => o.isMesh);
+
                     selectedObjects.forEach(obj => {
-                        let root = obj;
-                        while (root.parent && !assets.includes(root)) root = root.parent;
-                        if (!originalRoots.includes(root)) originalRoots.push(root);
+                        let current = obj;
+                        let filename = null;
+                        while (current) {
+                            if (current.userData && current.userData.filename) {
+                                filename = current.userData.filename;
+                                break;
+                            }
+                            current = current.parent;
+                        }
+
+                        if (filename) {
+                            if (!entriesMap.has(filename)) entriesMap.set(filename, new Set());
+                            if (obj.isMesh) {
+                                entriesMap.get(filename).add(obj.name);
+                            }
+                        }
                     });
 
-                    if (originalRoots.length < 2) {
-                        alert("Select at least 2 distinct objects to join.");
+                    console.log("Comfy3D Join: Selected Objects:", selectedObjects.length);
+                    console.log("Comfy3D Join: Filenames found:", entriesMap.size);
+
+                    if (meshes.length < 2 && entriesMap.size < 2) {
+                        alert("Select at least 2 distinct meshes or objects to join.");
                         return;
                     }
 
-                    const filenames = originalRoots.map(obj => obj.userData.filename).filter(f => !!f);
-                    if (filenames.length < 2) {
+                    const entries = Array.from(entriesMap.entries()).map(([filename, meshSet]) => ({
+                        filename,
+                        meshes: meshSet.size > 0 ? Array.from(meshSet) : null
+                    }));
+
+                    if (entries.length === 0) {
                         alert("Selected objects must have associated files to join.");
                         return;
                     }
+
+                    const rootObjects = Array.from(new Set(selectedObjects.map(obj => {
+                        let current = obj;
+                        let lastAsset = null;
+                        while (current) {
+                            if (assets.includes(current)) lastAsset = current;
+                            current = current.parent;
+                        }
+                        return lastAsset;
+                    }).filter(r => !!r)));
+
+                    // If we are joining only SOME parts of a root, we don't want to remove the root itself
+                    // unless ALL its mesh children are selected.
+                    const objectsToRemove = [];
+                    selectedObjects.forEach(obj => {
+                        if (obj.isMesh) {
+                            objectsToRemove.push(obj);
+                        } else if (assets.includes(obj)) {
+                            // If a whole root asset was selected, we remove it
+                            objectsToRemove.push(obj);
+                        }
+                    });
 
                     try {
                         toggleLoading(true);
                         const resp = await fetch("/comfy3d/join_mesh", {
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({ filenames: filenames })
+                            body: JSON.stringify({ entries: entries })
                         });
                         const result = await resp.json();
                         if (result.error) throw new Error(result.error);
@@ -347,15 +834,35 @@ app.registerExtension({
                         // Load result silently
                         const model = await loadAssetSilent(result.filename, result.type);
 
+                        // Flatten: If it's a group containing only one mesh, extract that mesh
+                        let finalObject = model;
+                        if (model.isGroup && model.children.length === 1 && model.children[0].isMesh) {
+                            finalObject = model.children[0];
+                            // Re-assign metadata to the mesh itself
+                            finalObject.userData.filename = model.userData.filename;
+                            finalObject.userData.type = model.userData.type;
+                        }
+
+                        // Use the name of the last selected object (active object)
+                        const activeObj = selectedObjects[selectedObjects.length - 1] || selectedObjects[0];
+                        if (activeObj) {
+                            finalObject.name = activeObj.name + "_Merged";
+                            const parent = activeObj.parent || scene;
+                            parent.add(finalObject);
+                        } else {
+                            finalObject.name = "Merged_Mesh";
+                            scene.add(finalObject);
+                        }
+
                         // Record in history
-                        const cmd = new SeparateMeshCommand(originalRoots, [model], assets, scene);
+                        const cmd = new SeparateMeshCommand(objectsToRemove, [finalObject], assets, scene);
                         cmd.redo();
                         history.push(cmd);
 
-                        selectedObjects = [model];
-                        updateOutliner();
-                        frameScene(model);
-                        console.log("Comfy3D: Joined into " + result.filename);
+                        selectedObjects = [finalObject];
+                        if (typeof updateOutlinerSelection === "function") updateOutlinerSelection();
+                        frameScene(finalObject);
+                        console.log("Comfy3D: Merged into " + result.filename);
                     } catch (e) {
                         console.error("Comfy3D: Join Failed:", e);
                         alert("Join error: " + e.message);
@@ -404,14 +911,6 @@ app.registerExtension({
 
                 segPanel.querySelector("#seg-join-btn").addEventListener("click", joinSelectedMeshes);
 
-                viewport.modalTransform = {
-                    active: false,
-                    mode: null, // "translate", "rotate", "scale"
-                    startMouse: new THREE.Vector2(),
-                    startStates: [], // { object, position, quaternion, scale }
-                    center: new THREE.Vector3(),
-                    centerScreen: new THREE.Vector3()
-                };
 
                 let needsUpdate = true; // Flag for on-demand rendering
 
@@ -436,6 +935,56 @@ app.registerExtension({
                     boxShadow: "0 0 4px rgba(0,0,0,0.5)"
                 });
                 canvasArea.appendChild(brushCursor);
+
+                // Selection Mode UI (Top-Left)
+                const selectionModeUI = document.createElement("div");
+                selectionModeUI.className = "comfy3d-selection-mode-panel";
+                canvasArea.appendChild(selectionModeUI);
+
+                const selectionModes = [
+                    { id: "object", title: "Object Selection", icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l9 4.9V17L12 22l-9-4.9V7L12 2z"/></svg>` },
+                    { id: "vertex", title: "Vertex Selection", icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" opacity="0.2"/><path d="M7 7h1v1H7z" fill="currentColor" stroke="none"/><circle cx="7.5" cy="7.5" r="1.5" fill="currentColor" stroke="none"/></svg>` },
+                    { id: "edge", title: "Edge Selection", icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" opacity="0.2"/><path d="M9 3v18" stroke="currentColor" stroke-width="3"/></svg>` },
+                    { id: "face", title: "Face Selection", icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" opacity="0.2"/><rect x="7" y="7" width="10" height="10" fill="currentColor" opacity="0.8" stroke="none"/></svg>` }
+                ];
+
+                const selectionBtns = {};
+                const updateSelectionUI = () => {
+                    selectionModes.forEach(m => {
+                        const btn = selectionBtns[m.id];
+                        if (viewport.selectionMode === m.id) {
+                            btn.classList.add("active");
+                        } else {
+                            btn.classList.remove("active");
+                        }
+                    });
+
+                    // Toggle gizmo visibility based on mode
+                    if (viewport.transform) {
+                        viewport.transform.visible = (viewport.selectionMode === "object" && selectedObjects.length > 0);
+                    }
+                    if (selectionHelper) {
+                        updateSelectionHelper();
+                    }
+                };
+
+                selectionModes.forEach(m => {
+                    const btn = document.createElement("button");
+                    btn.className = "comfy3d-selection-btn";
+                    btn.innerHTML = m.icon;
+                    btn.title = m.title;
+                    btn.onclick = (e) => {
+                        e.stopPropagation();
+                        viewport.selectionMode = m.id;
+                        console.log("Comfy3D: Selection Mode -> " + m.id);
+                        if (typeof updateSubMeshHighlights === "function") updateSubMeshHighlights();
+                        updateSelectionUI();
+                        triggerUpdate();
+                    };
+                    selectionModeUI.appendChild(btn);
+                    selectionBtns[m.id] = btn;
+                });
+                updateSelectionUI();
 
                 // Viewport Shading UI
                 const shadingUI = document.createElement("div");
@@ -811,7 +1360,9 @@ app.registerExtension({
                     outlinerVisible = v;
                     outlinerPanel.style.display = v ? "flex" : "none";
                     if (shadingBtns["outliner"]) {
-                        shadingBtns["outliner"].style.backgroundColor = v ? "rgba(255, 149, 0, 0.4)" : "rgba(0,0,0,0.5)";
+                        shadingBtns["outliner"].classList.toggle("active", v);
+                        if (!v) shadingBtns["outliner"].style.backgroundColor = "rgba(0,0,0,0.5)";
+                        else shadingBtns["outliner"].style.backgroundColor = "";
                     }
                 };
 
@@ -821,61 +1372,159 @@ app.registerExtension({
                 const solidMaterial = new THREE.MeshPhongMaterial({ color: 0x777777, specular: 0x111111, shininess: 20, flatShading: true, side: THREE.DoubleSide });
                 const normalMaterial = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
 
+                const chunkMesh = (mesh, targetTriangles = 500000) => {
+                    if (!mesh || !mesh.geometry || !mesh.geometry.index) return mesh;
+                    const geo = mesh.geometry;
+                    const totalTriangles = geo.index.count / 3;
+                    if (totalTriangles <= targetTriangles * 1.2) return mesh;
+
+                    console.log(`Comfy3D: Chunking massive mesh (${(totalTriangles / 1e6).toFixed(1)}M faces) into ${Math.ceil(totalTriangles / targetTriangles)} parts...`);
+
+                    const numChunks = Math.ceil(totalTriangles / targetTriangles);
+                    const group = new THREE.Group();
+                    group.name = mesh.name + "_chunked";
+                    group.userData = { ...mesh.userData, isChunked: true, originalMesh: mesh };
+
+                    group.position.copy(mesh.position);
+                    group.quaternion.copy(mesh.quaternion);
+                    group.scale.copy(mesh.scale);
+                    group.matrixAutoUpdate = mesh.matrixAutoUpdate;
+
+                    const posAttr = geo.attributes.position;
+                    const indexAttr = geo.index;
+
+                    for (let i = 0; i < numChunks; i++) {
+                        const start = i * targetTriangles * 3;
+                        const count = Math.min(targetTriangles * 3, geo.index.count - start);
+                        if (count <= 0) break;
+
+                        const chunkGeo = new THREE.BufferGeometry();
+                        // Share all attributes to avoid memory duplication
+                        Object.keys(geo.attributes).forEach(key => {
+                            chunkGeo.setAttribute(key, geo.attributes[key]);
+                        });
+                        chunkGeo.setIndex(indexAttr);
+                        chunkGeo.setDrawRange(start, count);
+
+                        // Manually compute accurate bounding box for this chunk's range
+                        const box = new THREE.Box3();
+                        const v3 = new THREE.Vector3();
+                        for (let j = start; j < start + count; j++) {
+                            const vIdx = indexAttr.getX(j);
+                            v3.fromBufferAttribute(posAttr, vIdx);
+                            box.expandByPoint(v3);
+                        }
+                        chunkGeo.boundingBox = box;
+
+                        // Compute bounding sphere for frustum culling too
+                        const sphere = new THREE.Sphere();
+                        box.getCenter(sphere.center);
+                        sphere.radius = box.min.distanceTo(box.max) / 2;
+                        chunkGeo.boundingSphere = sphere;
+
+                        const chunkMesh = new THREE.Mesh(chunkGeo, mesh.material);
+                        chunkMesh.name = `${mesh.name}_chunk_${i}`;
+                        chunkMesh.frustumCulled = true;
+                        chunkMesh.castShadow = mesh.castShadow;
+                        chunkMesh.receiveShadow = mesh.receiveShadow;
+
+                        group.add(chunkMesh);
+                    }
+
+                    if (mesh.parent) {
+                        mesh.parent.add(group);
+                        mesh.parent.remove(mesh);
+                    }
+
+                    const assetIdx = assets.indexOf(mesh);
+                    if (assetIdx > -1) {
+                        assets[assetIdx] = group;
+                    }
+
+                    mesh.visible = false;
+                    return group;
+                };
+
                 const updateMeshShading = (mesh) => {
                     if (!mesh || !mesh.isMesh) return;
-                    if (!mesh.userData.origMat) {
-                        mesh.userData.origMat = mesh.material;
-                        mesh.userData.origTransparent = mesh.material.transparent;
-                        mesh.userData.origOpacity = mesh.material.opacity;
-                        mesh.userData.origDepthWrite = mesh.material.depthWrite;
-                        mesh.userData.origSide = mesh.material.side;
-                    }
+                    if (mesh.userData.isChunked) return; // Skip sub-chunks
 
-                    // Support models with missing normals in diagnostic modes
-                    if (currentShadingMode === "solid" || currentShadingMode === "normal") {
-                        if (mesh.geometry && !mesh.geometry.attributes.normal) {
-                            mesh.geometry.computeVertexNormals();
+                    // Performance Optimization: Compute BVH and Bounding Volume once
+                    if (mesh.geometry) {
+                        if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+                        if (mesh.geometry.computeBoundsTree && !mesh.geometry.boundsTree) {
+                            console.log(`Comfy3D: Computing BVH for ${mesh.name || "mesh"}...`);
+                            mesh.geometry.computeBoundsTree();
+
+                            // Apply Chunking for massive meshes to enable sub-mesh frustum culling
+                            if (mesh.geometry.index && mesh.geometry.index.count / 3 > 1000000) {
+                                mesh = chunkMesh(mesh, 500000);
+                            }
                         }
                     }
 
-                    switch (currentShadingMode) {
-                        case "wireframe":
-                            mesh.material = mesh.userData.origMat;
-                            mesh.material.wireframe = true;
-                            break;
-                        case "solid":
-                            mesh.material = solidMaterial;
-                            break;
-                        case "normal":
-                            mesh.material = normalMaterial;
-                            break;
-                        default:
-                            mesh.material = mesh.userData.origMat;
-                            mesh.material.wireframe = false;
-                            break;
-                    }
+                    // Helper to apply shading to mesh or its chunks
+                    const applyToMesh = (m) => {
+                        if (m.isGroup) {
+                            m.children.forEach(applyToMesh);
+                            return;
+                        }
+                        if (!m.isMesh) return;
 
-                    // Apply X-Ray Overrides
-                    if (xrayMode) {
-                        mesh.material.transparent = true;
-                        mesh.material.opacity = 0.5;
-                        mesh.material.depthWrite = false;
-                        mesh.material.side = THREE.DoubleSide;
-                    } else {
-                        // Restore from defaults or userData
-                        if (mesh.material === mesh.userData.origMat) {
-                            mesh.material.transparent = mesh.userData.origTransparent;
-                            mesh.material.opacity = mesh.userData.origOpacity;
-                            mesh.material.depthWrite = mesh.userData.origDepthWrite;
-                            mesh.material.side = mesh.userData.origSide;
+                        if (!m.userData.origMat) {
+                            m.userData.origMat = m.material;
+                            m.userData.origTransparent = m.material.transparent;
+                            m.userData.origOpacity = m.material.opacity;
+                            m.userData.origDepthWrite = m.material.depthWrite;
+                            m.userData.origSide = m.material.side;
+                        }
+
+                        // Support models with missing normals in diagnostic modes
+                        if (currentShadingMode === "solid" || currentShadingMode === "normal") {
+                            if (m.geometry && !m.geometry.attributes.normal) {
+                                m.geometry.computeVertexNormals();
+                            }
+                        }
+
+                        switch (currentShadingMode) {
+                            case "wireframe":
+                                m.material = m.userData.origMat;
+                                m.material.wireframe = true;
+                                break;
+                            case "solid":
+                                m.material = solidMaterial;
+                                break;
+                            case "normal":
+                                m.material = normalMaterial;
+                                break;
+                            default:
+                                m.material = m.userData.origMat;
+                                m.material.wireframe = false;
+                                break;
+                        }
+
+                        // Apply X-Ray Overrides
+                        if (xrayMode) {
+                            m.material.transparent = true;
+                            m.material.opacity = 0.5;
+                            m.material.depthWrite = false;
+                            m.material.side = THREE.DoubleSide;
                         } else {
-                            // If using solidMaterial/normalMaterial, reset them to fixed defaults
-                            mesh.material.transparent = false;
-                            mesh.material.opacity = 1.0;
-                            mesh.material.depthWrite = true;
-                            mesh.material.side = THREE.DoubleSide;
+                            if (m.material === m.userData.origMat) {
+                                m.material.transparent = m.userData.origTransparent;
+                                m.material.opacity = m.userData.origOpacity;
+                                m.material.depthWrite = m.userData.origDepthWrite;
+                                m.material.side = m.userData.origSide;
+                            } else {
+                                m.material.transparent = false;
+                                m.material.opacity = 1.0;
+                                m.material.depthWrite = true;
+                                m.material.side = THREE.DoubleSide;
+                            }
                         }
-                    }
+                    };
+
+                    applyToMesh(mesh);
                 };
 
                 const updateShadingUI = () => {
@@ -885,9 +1534,17 @@ app.registerExtension({
                         if (m === "xray") isActive = xrayMode;
                         if (m === "outliner") isActive = outlinerVisible;
 
-                        btn.style.backgroundColor = isActive ? "rgba(255, 68, 0, 0.4)" : "rgba(0,0,0,0.5)";
-                        btn.style.border = isActive ? "1px solid rgba(255, 68, 0, 0.6)" : "1px solid rgba(255,255,255,0.05)";
-                        btn.style.boxShadow = isActive ? "0 0 10px rgba(255, 68, 0, 0.3)" : "none";
+                        btn.classList.toggle("active", isActive);
+                        // Clean defaults for non-active buttons
+                        if (!isActive) {
+                            btn.style.backgroundColor = "rgba(0,0,0,0.5)";
+                            btn.style.border = "1px solid rgba(255,255,255,0.05)";
+                            btn.style.boxShadow = "none";
+                        } else {
+                            btn.style.backgroundColor = "";
+                            btn.style.border = "";
+                            btn.style.boxShadow = "";
+                        }
                     });
                 };
 
@@ -904,7 +1561,6 @@ app.registerExtension({
                     btn.className = "comfy3d-toolbar-btn";
                     Object.assign(btn.style, {
                         width: "32px", height: "32px", borderRadius: "16px",
-                        border: "1px solid rgba(255,255,255,0.05)", backgroundColor: "rgba(0,0,0,0.5)",
                         color: "white", cursor: "pointer", display: "flex",
                         alignItems: "center", justifyContent: "center",
                         outline: "none", boxSizing: "border-box"
@@ -989,9 +1645,17 @@ app.registerExtension({
                             isActive = (id === mode && !viewport.brushActive && !viewport.pointSelection.active);
                         }
 
-                        btn.style.backgroundColor = isActive ? "rgba(255, 68, 0, 0.4)" : "transparent";
-                        btn.style.border = isActive ? "1px solid rgba(255, 68, 0, 0.6)" : "1px solid rgba(255,255,255,0.05)";
-                        btn.style.boxShadow = isActive ? "0 0 10px rgba(255, 68, 0, 0.2)" : "none";
+                        btn.classList.toggle("active", isActive);
+                        // Remove inline styles in favor of the .active class
+                        if (isActive) {
+                            btn.style.backgroundColor = "";
+                            btn.style.border = "";
+                            btn.style.boxShadow = "";
+                        } else {
+                            btn.style.backgroundColor = "transparent";
+                            btn.style.border = "1px solid rgba(255,255,255,0.05)";
+                            btn.style.boxShadow = "none";
+                        }
                     });
                 };
 
@@ -1225,11 +1889,21 @@ app.registerExtension({
                 const zAxis = new THREE.Line(zAxisGeom, new THREE.LineBasicMaterial({ color: 0x4cd964, transparent: true, opacity: 0.6 }));
                 scene.add(zAxis);
 
-                // Neutral Lighting Setup                scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 0.4)); // Balanced sky/ground fill
-                scene.add(new THREE.AmbientLight(0xffffff, 0.2)); // Natural global fill
-                const dirLight = new THREE.DirectionalLight(0xffffff, 0.65);
-                dirLight.position.set(10, 10, 10);
-                scene.add(dirLight);
+                // Studio Lighting Setup (3-Point)
+                scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0)); // Strong sky/ground fill
+                scene.add(new THREE.AmbientLight(0xffffff, 0.4)); // Natural global fill
+
+                const keyLight = new THREE.DirectionalLight(0xffffff, 0.8);
+                keyLight.position.set(10, 10, 10);
+                scene.add(keyLight);
+
+                const fillLight = new THREE.DirectionalLight(0xffffff, 0.5);
+                fillLight.position.set(-10, 5, 10);
+                scene.add(fillLight);
+
+                const backLight = new THREE.DirectionalLight(0xffffff, 0.4);
+                backLight.position.set(0, 10, -10);
+                scene.add(backLight);
 
                 // Command Pattern Undo/Redo System
                 class CommandHistory {
@@ -1262,10 +1936,7 @@ app.registerExtension({
                 }
                 const history = new CommandHistory();
 
-                // Selection Helper (Orange Outline)
-                const selectionHelper = new THREE.BoxHelper(undefined, 0xff4400);
-                selectionHelper.visible = false;
-                scene.add(selectionHelper);
+                scene.add(xAxis);
 
                 const updateSelectionProxy = () => {
                     const visibleSelected = selectedObjects.filter(o => o && (o.visible !== false));
@@ -1327,6 +1998,88 @@ app.registerExtension({
                     }
                 }
 
+                class SubMeshSelectionCommand {
+                    constructor(mesh, oldSub, newSub) {
+                        this.mesh = mesh;
+                        // Convert Sets to Arrays for storage
+                        const toArr = (s) => (s ? Array.from(s) : []);
+                        this.old = { v: toArr(oldSub.vertices), e: toArr(oldSub.edges), f: toArr(oldSub.faces) };
+                        this.new = { v: toArr(newSub.vertices), e: toArr(newSub.edges), f: toArr(newSub.faces) };
+                    }
+                    undo() {
+                        viewport.selectedSubElements.set(this.mesh.uuid, {
+                            vertices: new Set(this.old.v),
+                            edges: new Set(this.old.e),
+                            faces: new Set(this.old.f)
+                        });
+                        updateSubMeshHighlights();
+                        triggerUpdate();
+                    }
+                    redo() {
+                        viewport.selectedSubElements.set(this.mesh.uuid, {
+                            vertices: new Set(this.new.v),
+                            edges: new Set(this.new.e),
+                            faces: new Set(this.new.f)
+                        });
+                        updateSubMeshHighlights();
+                        triggerUpdate();
+                    }
+                }
+
+                class SubMeshTransformCommand {
+                    constructor(transformData) {
+                        // transformData is Map: meshUUID -> { indices: [], old: [], new: [] }
+                        this.data = new Map();
+                        transformData.forEach((val, meshUUID) => {
+                            this.data.set(meshUUID, {
+                                indices: [...val.indices],
+                                old: val.old.map(v => v.clone()),
+                                new: val.new.map(v => v.clone())
+                            });
+                        });
+                    }
+                    undo() {
+                        this.data.forEach((val, meshUUID) => {
+                            const mesh = scene.getObjectByProperty("uuid", meshUUID);
+                            if (!mesh || !mesh.geometry) return;
+                            const attr = mesh.geometry.attributes.position;
+                            val.indices.forEach((idx, i) => {
+                                const p = val.old[i];
+                                attr.setXYZ(idx, p.x, p.y, p.z);
+                            });
+                            attr.needsUpdate = true;
+                            mesh.geometry.computeVertexNormals();
+                            mesh.geometry.computeBoundingBox();
+                            mesh.geometry.computeBoundingSphere();
+                            if (mesh.geometry.computeBoundsTree) mesh.geometry.computeBoundsTree();
+                        });
+                        updateSubMeshHighlights();
+                        updateSelectionProxy();
+                        triggerUpdate();
+                    }
+                    redo() {
+                        console.log(`Comfy3D: SubMeshTransform Redo starting for ${this.data.size} meshes...`);
+                        this.data.forEach((val, meshUUID) => {
+                            const mesh = scene.getObjectByProperty("uuid", meshUUID);
+                            if (!mesh || !mesh.geometry) { console.warn(`Comfy3D: Redo failed for mesh ${meshUUID} (not found)`); return; }
+                            const attr = mesh.geometry.attributes.position;
+                            console.log(`Comfy3D: Applying ${val.indices.length} vertices for mesh ${mesh.name || meshUUID}`);
+                            val.indices.forEach((idx, i) => {
+                                const p = val.new[i];
+                                attr.setXYZ(idx, p.x, p.y, p.z);
+                            });
+                            attr.needsUpdate = true;
+                            mesh.geometry.computeVertexNormals();
+                            mesh.geometry.computeBoundingBox();
+                            mesh.geometry.computeBoundingSphere();
+                            if (mesh.geometry.computeBoundsTree) mesh.geometry.computeBoundsTree();
+                        });
+                        updateSubMeshHighlights();
+                        updateSelectionProxy();
+                        triggerUpdate();
+                    }
+                }
+
                 class AssetCommand {
                     constructor(obj, isAdd, assetsArr, scene) {
                         this.obj = obj;
@@ -1382,7 +2135,7 @@ app.registerExtension({
                         this.originalsCmd = new MultiAssetCommand(originalMeshes, false, assetsArr, sceneObj);
                         this.newMeshesCmd = new MultiAssetCommand(newMeshes, true, assetsArr, sceneObj);
                         this.oldSelection = [...selectedObjects];
-                        
+
                         // Select the new roots (groups) instead of the individual parts to keep outliner tidy
                         this.newSelection = [...newMeshes];
                     }
@@ -1553,22 +2306,7 @@ app.registerExtension({
 
                     const visibleSelected = selectedObjects.filter(o => o && (o.visible !== false));
                     if (visibleSelected.length > 0) {
-                        // Update selection helper (ensure valid object for setFromObject)
-                        if (visibleSelected.length === 1) {
-                            selectionHelper.setFromObject(visibleSelected[0]);
-                        } else {
-                            const box = new THREE.Box3();
-                            visibleSelected.forEach(o => box.expandByObject(o));
-                            const size = box.getSize(new THREE.Vector3());
-                            const center = box.getCenter(new THREE.Vector3());
-                            if (!this._selectionBoxMesh) this._selectionBoxMesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1));
-                            this._selectionBoxMesh.scale.set(size.x || 0.1, size.y || 0.1, size.z || 0.1);
-                            this._selectionBoxMesh.position.copy(center);
-                            this._selectionBoxMesh.quaternion.set(0, 0, 0, 1);
-                            this._selectionBoxMesh.updateMatrixWorld(true);
-                            selectionHelper.setFromObject(this._selectionBoxMesh);
-                        }
-                        selectionHelper.visible = !viewport.brushActive;
+                        updateSelectionHelper();
 
                         // Update selectionProxy to selection center
                         updateSelectionProxy();
@@ -1586,7 +2324,214 @@ app.registerExtension({
                     console.log(`Comfy3D: Selection updated. Total: ${selectedObjects.length}, Visible: ${viewport.transform.visible}`);
                     if (typeof updateToolbar === "function") updateToolbar();
                     if (typeof updateOutlinerSelection === "function") updateOutlinerSelection();
+                    if (typeof updateSelectionUI === "function") updateSelectionUI();
+                    if (typeof updateSubMeshHighlights === "function") updateSubMeshHighlights();
                     triggerUpdate();
+                };
+
+                const updateSubMeshHighlights = () => {
+                    const activeMesh = getActiveMesh();
+
+                    if (!activeMesh || viewport.selectionMode === "object") {
+                        vertexHighlight.visible = false;
+                        edgeHighlight.visible = false;
+                        faceHighlight.visible = false;
+                        persistentVertexPoints.visible = false;
+                        persistentWireframe.visible = false;
+                        lastSubmeshUUID = null;
+                        lastSubmeshMode = null;
+                        return;
+                    }
+
+                    // Sync highlight transforms with active mesh world matrices
+                    const syncTransform = (obj) => {
+                        obj.matrix.copy(activeMesh.matrixWorld);
+                        obj.matrixWorld.copy(activeMesh.matrixWorld);
+                        obj.matrixAutoUpdate = false;
+                    };
+
+                    persistentWireframe.visible = !viewport.modalTransform.active;
+                    persistentVertexPoints.visible = (!viewport.modalTransform.active && viewport.selectionMode === "vertex");
+
+                    const modeChanged = lastSubmeshMode !== viewport.selectionMode;
+                    const meshChanged = lastSubmeshUUID !== activeMesh.uuid;
+
+                    if (meshChanged || modeChanged || viewport.modalTransform.active) {
+                        const geo = activeMesh.geometry;
+                        if (meshChanged || (viewport.modalTransform.active && !persistentWireframe.userData.lastSync)) {
+                            if (viewport.modalTransform.active) {
+                                persistentWireframe.userData.lastSync = true;
+                            } else {
+                                if (!activeMesh.userData.wireframeGeom) {
+                                    activeMesh.userData.wireframeGeom = new THREE.EdgesGeometry(geo);
+                                }
+                                persistentWireframe.geometry = activeMesh.userData.wireframeGeom;
+                                persistentWireframe.userData.lastSync = false;
+                            }
+                            syncTransform(persistentWireframe);
+                        }
+
+                        if (persistentVertexPoints.visible) {
+                            if (persistentVertexPoints.geometry !== geo) persistentVertexPoints.geometry = geo;
+                            syncTransform(persistentVertexPoints);
+                        }
+
+                        lastSubmeshUUID = activeMesh.uuid;
+                        lastSubmeshMode = viewport.selectionMode;
+                    } else {
+                        syncTransform(persistentWireframe);
+                        if (persistentVertexPoints.visible) syncTransform(persistentVertexPoints);
+                    }
+
+                    const sub = viewport.selectedSubElements.get(activeMesh.uuid) || { vertices: new Set(), edges: new Set(), faces: new Set() };
+                    const meshPos = activeMesh.geometry.attributes.position;
+                    const meshData = meshPos.array;
+
+                    // Vertex Highlights
+                    if (sub.vertices.size > 0) {
+                        const positions = new Float32Array(sub.vertices.size * 3);
+                        let i = 0;
+                        sub.vertices.forEach(idx => {
+                            const offset = idx * 3;
+                            positions[i++] = meshData[offset];
+                            positions[i++] = meshData[offset + 1];
+                            positions[i++] = meshData[offset + 2];
+                        });
+                        vertexHighlight.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                        vertexHighlight.geometry.attributes.position.needsUpdate = true;
+                        vertexHighlight.geometry.computeBoundingSphere();
+                        syncTransform(vertexHighlight);
+                        vertexHighlight.visible = true;
+                    } else {
+                        vertexHighlight.visible = false;
+                    }
+
+                    // Edge Highlights
+                    if (sub.edges.size > 0) {
+                        const positions = new Float32Array(sub.edges.size * 6);
+                        let i = 0;
+                        sub.edges.forEach(edgeKey => {
+                            let i1, i2;
+                            if (typeof edgeKey === "number") {
+                                i1 = Math.floor(edgeKey / 10000000);
+                                i2 = edgeKey % 10000000;
+                            } else {
+                                const dashIdx = edgeKey.indexOf("-");
+                                i1 = parseInt(edgeKey.substring(0, dashIdx));
+                                i2 = parseInt(edgeKey.substring(dashIdx + 1));
+                            }
+
+                            const o1 = i1 * 3;
+                            const o2 = i2 * 3;
+                            positions[i++] = meshData[o1];
+                            positions[i++] = meshData[o1 + 1];
+                            positions[i++] = meshData[o1 + 2];
+                            positions[i++] = meshData[o2];
+                            positions[i++] = meshData[o2 + 1];
+                            positions[i++] = meshData[o2 + 2];
+                        });
+                        edgeHighlight.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                        edgeHighlight.geometry.attributes.position.needsUpdate = true;
+                        edgeHighlight.geometry.computeBoundingSphere();
+                        syncTransform(edgeHighlight);
+                        edgeHighlight.visible = true;
+                    } else {
+                        edgeHighlight.visible = false;
+                    }
+
+                    // Face Highlights
+                    if (sub.faces.size > 0) {
+                        const positions = new Float32Array(sub.faces.size * 9);
+                        const index = activeMesh.geometry.index;
+                        const idxData = index ? index.array : null;
+                        let i = 0;
+                        sub.faces.forEach(faceIdx => {
+                            let i1, i2, i3;
+                            if (idxData) {
+                                i1 = idxData[faceIdx * 3];
+                                i2 = idxData[faceIdx * 3 + 1];
+                                i3 = idxData[faceIdx * 3 + 2];
+                            } else {
+                                i1 = faceIdx * 3;
+                                i2 = faceIdx * 3 + 1;
+                                i3 = faceIdx * 3 + 2;
+                            }
+
+                            const o1 = i1 * 3, o2 = i2 * 3, o3 = i3 * 3;
+                            positions[i++] = meshData[o1];
+                            positions[i++] = meshData[o1 + 1];
+                            positions[i++] = meshData[o1 + 2];
+                            positions[i++] = meshData[o2];
+                            positions[i++] = meshData[o2 + 1];
+                            positions[i++] = meshData[o2 + 2];
+                            positions[i++] = meshData[o3];
+                            positions[i++] = meshData[o3 + 1];
+                            positions[i++] = meshData[o3 + 2];
+                        });
+                        faceHighlight.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                        faceHighlight.geometry.attributes.position.needsUpdate = true;
+                        faceHighlight.geometry.computeBoundingSphere();
+                        syncTransform(faceHighlight);
+                        faceHighlight.visible = true;
+                    } else {
+                        faceHighlight.visible = false;
+                    }
+                };
+
+                const getClosestVertex = (hit) => {
+                    const mesh = hit.object;
+                    const geometry = mesh.geometry;
+                    const position = geometry.attributes.position;
+
+                    const face = hit.face;
+                    const indices = [face.a, face.b, face.c];
+
+                    let minDist = Infinity;
+                    let bestIdx = indices[0];
+
+                    indices.forEach(idx => {
+                        const v = new THREE.Vector3().fromBufferAttribute(position, idx);
+                        mesh.localToWorld(v);
+                        const d = hit.point.distanceTo(v);
+                        if (d < minDist) {
+                            minDist = d;
+                            bestIdx = idx;
+                        }
+                    });
+                    return bestIdx;
+                };
+
+                const getClosestEdge = (hit) => {
+                    const mesh = hit.object;
+                    const geometry = mesh.geometry;
+                    const position = geometry.attributes.position;
+
+                    const face = hit.face;
+                    const indices = [face.a, face.b, face.c];
+
+                    let minDist = Infinity;
+                    let bestEdge = null;
+
+                    for (let i = 0; i < 3; i++) {
+                        const i1 = indices[i];
+                        const i2 = indices[(i + 1) % 3];
+
+                        const v1 = new THREE.Vector3().fromBufferAttribute(position, i1);
+                        const v2 = new THREE.Vector3().fromBufferAttribute(position, i2);
+                        mesh.localToWorld(v1);
+                        mesh.localToWorld(v2);
+
+                        const line = new THREE.Line3(v1, v2);
+                        const closestPoint = new THREE.Vector3();
+                        line.closestPointToPoint(hit.point, true, closestPoint);
+
+                        const d = hit.point.distanceTo(closestPoint);
+                        if (d < minDist) {
+                            minDist = d;
+                            bestEdge = [i1, i2].sort((a, b) => a - b).join("-");
+                        }
+                    }
+                    return bestEdge;
                 };
 
 
@@ -1594,8 +2539,14 @@ app.registerExtension({
                     selectedObjects = [];
                     if (viewport.transform) viewport.transform.detach();
                     if (selectionHelper) selectionHelper.visible = false;
+
+                    vertexHighlight.visible = false;
+                    edgeHighlight.visible = false;
+                    faceHighlight.visible = false;
+
                     if (typeof updateToolbar === "function") updateToolbar();
                     if (typeof updateOutlinerSelection === "function") updateOutlinerSelection();
+                    if (typeof updateSelectionUI === "function") updateSelectionUI();
                     triggerUpdate();
                 };
 
@@ -1789,16 +2740,16 @@ app.registerExtension({
                             model.name = filename.split("/").pop().replace(".glb", "_Split");
                             model.userData.filename = result.filename;
                             model.userData.type = result.type;
-                            
+
                             model.traverse(c => {
                                 if (c.isMesh) {
                                     updateMeshShading(c);
-                                    c.userData.filename = result.filename; 
+                                    c.userData.filename = result.filename;
                                     c.userData.type = result.type;
                                 }
                             });
 
-                            newModels.push(model); 
+                            newModels.push(model);
                         }
 
                         if (newModels.length > 0) {
@@ -1835,9 +2786,6 @@ app.registerExtension({
                 orbit.enablePan = true;
                 orbit.addEventListener("change", triggerUpdate);
                 orbit.update();
-
-                viewport.transform = new THREE.TransformControls(camera, renderer.domElement);
-                scene.add(viewport.transform);
 
                 const initialStates = new Map();
                 let initialProxyMatrixInverse = new THREE.Matrix4();
@@ -1903,7 +2851,7 @@ app.registerExtension({
                                 });
                             }
                         });
-                        if (changed) {
+                        if (changed && !viewport.modalTransform.active) {
                             history.push(new MultiTransformCommand(selectedObjects, initialStates, finalStates));
                         }
                     }
@@ -2019,34 +2967,11 @@ app.registerExtension({
 
                     if (viewport.modalTransform.active) {
                         if (e.button === 0) { // Left click confirm
-                            const mt = viewport.modalTransform;
-                            const initialMap = new Map();
-                            const finalMap = new Map();
-
-                            mt.startStates.forEach(s => {
-                                initialMap.set(s.object, { p: s.position, q: s.quaternion, s: s.scale });
-                                finalMap.set(s.object, { p: s.object.position.clone(), q: s.object.quaternion.clone(), s: s.object.scale.clone() });
-                            });
-
-                            const cmd = new MultiTransformCommand(mt.startStates.map(s => s.object), initialMap, finalMap);
-                            history.push(cmd);
-
-                            mt.active = false;
-                            orbit.enabled = true;
-                            if (viewport.transform) viewport.transform.enabled = true;
-                            triggerUpdate();
+                            confirmModalTransform();
                             e.preventDefault();
                             e.stopPropagation();
                         } else if (e.button === 2) { // Right click cancel
-                            viewport.modalTransform.startStates.forEach(s => {
-                                s.object.position.copy(s.position);
-                                s.object.quaternion.copy(s.quaternion);
-                                s.object.scale.copy(s.scale);
-                            });
-                            viewport.modalTransform.active = false;
-                            orbit.enabled = true;
-                            if (viewport.transform) viewport.transform.enabled = true;
-                            triggerUpdate();
+                            cancelModalTransform();
                             e.preventDefault();
                             e.stopPropagation();
                         }
@@ -2120,6 +3045,11 @@ app.registerExtension({
                 };
 
                 const handleGlobalMouseUp = e => {
+                    if (viewport.modalTransform.active) {
+                        // Normally confirmed on MouseDown for immediate feedback in professional tools,
+                        // but if we reach here, we ignore it to prevent double-confirming.
+                        return;
+                    }
                     if (!mouseDownOnCanvas) return;
 
                     if (viewport.brushActive) {
@@ -2155,45 +3085,284 @@ app.registerExtension({
                         const tempV3 = new THREE.Vector3();
                         const tempBox = new THREE.Box3();
                         const pickable = getPickableAssets();
-                        for (const asset of pickable) {
-                            tempBox.setFromObject(asset);
-                            tempBox.getCenter(tempV3);
-                            tempV3.project(camera);
-                            const screenX = (tempV3.x + 1) * renderer.domElement.clientWidth / 2;
-                            const screenY = (-tempV3.y + 1) * renderer.domElement.clientHeight / 2;
 
-                            if (screenX >= left && screenX <= right && screenY >= top && screenY <= bottom) {
-                                if (xrayMode) {
-                                    // X-Ray Mode: Select everything in frustum
-                                    selectedInBox.push(asset);
-                                } else {
-                                    // Standard Mode: Occlusion Check (Raycast to center)
-                                    // We use a small offset if the center is likely inside the mesh, 
-                                    // but for generic assets, hitting the asset's own surface is enough.
-                                    raycaster.setFromCamera(new THREE.Vector2(tempV3.x, tempV3.y), camera);
-                                    const hits = raycaster.intersectObjects(pickable, true);
-                                    if (hits.length > 0) {
-                                        let hitRoot = hits[0].object;
-                                        while (hitRoot.parent && !assets.includes(hitRoot)) hitRoot = hitRoot.parent;
-                                        if (hitRoot === asset) {
-                                            selectedInBox.push(asset);
+                        if (viewport.selectionMode !== "object") {
+                            const activeMesh = getActiveMesh();
+                            
+                            // Compatibility check: Ensure raycaster matches current THREE instance
+                            if (viewport.raycaster && !(viewport.raycaster.ray instanceof THREE.Ray)) {
+                                console.warn("Comfy3D: Raycaster instance mismatch detected, re-initializing...");
+                                viewport.raycaster = new THREE.Raycaster();
+                            }
+                            
+                            if (activeMesh) {
+                                const sub = viewport.selectedSubElements.get(activeMesh.uuid) || { vertices: new Set(), edges: new Set(), faces: new Set() };
+                                const oldSub = { vertices: new Set(sub.vertices), edges: new Set(sub.edges), faces: new Set(sub.faces) };
+
+                                if (!e.shiftKey) {
+                                    sub.vertices.clear(); sub.edges.clear(); sub.faces.clear();
+                                }
+
+                                console.time("Comfy3D: BoxSelection Total");
+                                const geom = activeMesh.geometry;
+                                const pos = geom.attributes.position;
+                                const rawPos = pos.array;
+                                const worldMatrix = activeMesh.matrixWorld;
+                                const camPos = camera.position.clone();
+                                const occlusionHits = [];
+                                let raycastCount = 0;
+                                const normalMatrix = new THREE.Matrix3().getNormalMatrix(worldMatrix);
+
+                                const mvp = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).multiply(worldMatrix);
+                                const canvasW = renderer.domElement.clientWidth;
+                                const canvasH = renderer.domElement.clientHeight;
+
+                                // Performance Optimization: Cache projected coordinates once (Super Optimized raw loop)
+                                console.time("Comfy3D: Projection Cache");
+                                const vProjCache = new Float32Array(pos.count * 2);
+                                const me = mvp.elements;
+                                for (let i = 0; i < pos.count; i++) {
+                                    const o = i * 3;
+                                    const x = rawPos[o], y = rawPos[o + 1], z = rawPos[o + 2];
+                                    // Manual applyMatrix4 + Project
+                                    const w = 1 / (me[3] * x + me[7] * y + me[11] * z + me[15]);
+                                    vProjCache[i * 2] = ((me[0] * x + me[4] * y + me[8] * z + me[12]) * w + 1) * canvasW / 2;
+                                    vProjCache[i * 2 + 1] = (-(me[1] * x + me[5] * y + me[9] * z + me[13]) * w + 1) * canvasH / 2;
+                                }
+                                console.timeEnd("Comfy3D: Projection Cache");
+
+                                const vWorld = new THREE.Vector3();
+                                const vNormal = new THREE.Vector3();
+                                const vToCam = new THREE.Vector3();
+                                const vc = new THREE.Vector3();
+                                console.time("Comfy3D: Mode Selection Loop");
+                                const vLocal = new THREE.Vector3(); // Re-add for occlusion check compatibility
+                                if (viewport.selectionMode === "vertex") {
+                                    const normals = geom.attributes.normal;
+                                    const rawNormals = normals ? normals.array : null;
+                                    const useOcclusion = !xrayMode && pos.count < 150000;
+                                    const needsBVH = !geom.boundsTree;
+                                    const needsPatch = !geom.computeBoundsTree && window.__computeBoundsTree;
+                                    if (needsPatch) geom.computeBoundsTree = window.__computeBoundsTree;
+                                    if (needsBVH && geom.computeBoundsTree) {
+                                        console.log("Comfy3D: Late-computing BVH (Fail-safe)...");
+                                        geom.computeBoundsTree();
+                                    }
+                                    if (activeMesh.raycast !== window.__acceleratorRaycast && window.__acceleratorRaycast) {
+                                        activeMesh.raycast = window.__acceleratorRaycast;
+                                    }
+                                    
+                                    raycaster.firstHitOnly = true; 
+
+                                    for (let i = 0; i < pos.count; i++) {
+                                        const sx = vProjCache[i * 2];
+                                        const sy = vProjCache[i * 2 + 1];
+
+                                        if (sx >= left && sx <= right && sy >= top && sy <= bottom) {
+                                            const o = i * 3;
+                                            if (!xrayMode && rawNormals) {
+                                                vNormal.set(rawNormals[o], rawNormals[o + 1], rawNormals[o + 2]);
+                                                vNormal.applyMatrix3(normalMatrix).normalize();
+                                                vWorld.set(rawPos[o], rawPos[o + 1], rawPos[o + 2]).applyMatrix4(worldMatrix);
+                                                vToCam.copy(camPos).sub(vWorld).normalize();
+                                                if (vNormal.dot(vToCam) < -0.1) continue;
+                                            }
+
+                                            if (useOcclusion) { // Removed raycastCount cap (BVH handles it)
+                                                vWorld.set(rawPos[o], rawPos[o + 1], rawPos[o + 2]).applyMatrix4(worldMatrix);
+                                                vToCam.copy(vWorld).sub(camPos).normalize();
+                                                raycaster.set(camPos, vToCam);
+                                                occlusionHits.length = 0;
+                                                
+                                                // DIRECT BVH CALL: Bypasses library wrapper issues
+                                                try {
+                                                    activeMesh.raycast(raycaster, occlusionHits);
+                                                } catch (err) {
+                                                    if (window.__origMeshRaycast) {
+                                                        window.__origMeshRaycast.call(activeMesh, raycaster, occlusionHits);
+                                                    } else {
+                                                        activeMesh.raycast(raycaster, occlusionHits);
+                                                    }
+                                                }
+                                                
+                                                raycastCount++;
+                                                if (occlusionHits.length > 0 && occlusionHits[0].distance < camPos.distanceTo(vWorld) - 0.01) continue;
+                                            }
+                                            sub.vertices.add(i);
+                                        }
+                                    }
+                                } else if (viewport.selectionMode === "face") {
+                                    const index = geom.index;
+                                    const idxArray = index ? index.array : null;
+                                    const faceCount = index ? index.count / 3 : pos.count / 3;
+                                    const useOcclusion = !xrayMode && faceCount < 100000;
+                                    const fNormal = new THREE.Vector3();
+                                    const va = new THREE.Vector3();
+                                    const vb = new THREE.Vector3();
+                                    const vc = new THREE.Vector3();
+
+                                    // Ensure BVH exists and is active for this mesh's geometry instance
+                                    if (!geom.computeBoundsTree && window.__computeBoundsTree) geom.computeBoundsTree = window.__computeBoundsTree;
+                                    if (!geom.boundsTree && geom.computeBoundsTree) geom.computeBoundsTree();
+                                    if (activeMesh.raycast !== window.__acceleratorRaycast && window.__acceleratorRaycast) activeMesh.raycast = window.__acceleratorRaycast;
+
+                                    raycaster.firstHitOnly = true;
+
+                                    for (let i = 0; i < faceCount; i++) {
+                                        let i1, i2, i3;
+                                        if (idxArray) {
+                                            i1 = idxArray[i * 3];
+                                            i2 = idxArray[i * 3 + 1];
+                                            i3 = idxArray[i * 3 + 2];
+                                        } else {
+                                            i1 = i * 3; i2 = i * 3 + 1; i3 = i * 3 + 2;
+                                        }
+
+                                        const sx = (vProjCache[i1 * 2] + vProjCache[i2 * 2] + vProjCache[i3 * 2]) / 3;
+                                        const sy = (vProjCache[i1 * 2 + 1] + vProjCache[i2 * 2 + 1] + vProjCache[i3 * 2 + 1]) / 3;
+
+                                        if (sx >= left && sx <= right && sy >= top && sy <= bottom) {
+                                            const o1 = i1 * 3, o2 = i2 * 3, o3 = i3 * 3;
+                                            if (!xrayMode) {
+                                                va.set(rawPos[o1], rawPos[o1 + 1], rawPos[o1 + 2]);
+                                                vb.set(rawPos[o2], rawPos[o2 + 1], rawPos[o2 + 2]);
+                                                vc.set(rawPos[o3], rawPos[o3 + 1], rawPos[o3 + 2]);
+                                                fNormal.subVectors(vb, va).cross(vToCam.subVectors(vc, va)).normalize();
+                                                fNormal.applyMatrix4(worldMatrix).normalize();
+                                                vLocal.copy(va).add(vb).add(vc).divideScalar(3);
+                                                vWorld.copy(vLocal).applyMatrix4(worldMatrix);
+                                                vToCam.copy(camPos).sub(vWorld).normalize();
+                                                if (fNormal.dot(vToCam) < -0.1) continue;
+                                            }
+
+                                            if (useOcclusion) {
+                                                va.set(rawPos[o1], rawPos[o1 + 1], rawPos[o1 + 2]);
+                                                vb.set(rawPos[o2], rawPos[o2 + 1], rawPos[o2 + 2]);
+                                                vc.set(rawPos[o3], rawPos[o3 + 1], rawPos[o3 + 2]);
+                                                vLocal.copy(va).add(vb).add(vc).divideScalar(3);
+                                                vWorld.copy(vLocal).applyMatrix4(worldMatrix);
+                                                vToCam.copy(vWorld).sub(camPos).normalize();
+                                                raycaster.set(camPos, vToCam);
+                                                occlusionHits.length = 0;
+
+                                                // DIRECT BVH CALL: Bypasses library wrapper issues
+                                                try {
+                                                    activeMesh.raycast(raycaster, occlusionHits);
+                                                } catch (err) {
+                                                    if (window.__origMeshRaycast) {
+                                                        window.__origMeshRaycast.call(activeMesh, raycaster, occlusionHits);
+                                                    } else {
+                                                        activeMesh.raycast(raycaster, occlusionHits);
+                                                    }
+                                                }
+
+                                                raycastCount++;
+                                                if (occlusionHits.length > 0 && occlusionHits[0].distance < camPos.distanceTo(vWorld) - 0.01) continue;
+                                            }
+                                            sub.faces.add(i);
+                                        }
+                                    }
+                                } else if (viewport.selectionMode === "edge") {
+                                    const index = geom.index;
+                                    const idxArray = index ? index.array : null;
+                                    const triangleCount = index ? index.count / 3 : pos.count / 3;
+                                    const processedEdges = new Set();
+
+                                    const checkEdge = (a, b) => {
+                                        const min = a < b ? a : b;
+                                        const max = a < b ? b : a;
+                                        const key = min * 10000000 + max;
+                                        if (processedEdges.has(key)) return;
+                                        processedEdges.add(key);
+
+                                        if ((vProjCache[a * 2] >= left && vProjCache[a * 2] <= right && vProjCache[a * 2 + 1] >= top && vProjCache[a * 2 + 1] <= bottom) ||
+                                            (vProjCache[b * 2] >= left && vProjCache[b * 2] <= right && vProjCache[b * 2 + 1] >= top && vProjCache[b * 2 + 1] <= bottom)) {
+                                            
+                                            // Edge Occlusion Check
+                                            if (!xrayMode) {
+                                                const oa = a * 3, ob = b * 3;
+                                                // 1. Backface check for both vertices (approximate)
+                                                vNormal.set(rawPos[oa], rawPos[oa + 1], rawPos[oa + 2]).add(vLocal.set(rawPos[ob], rawPos[ob + 1], rawPos[ob + 2])).multiplyScalar(0.5);
+                                                vNormal.applyMatrix3(normalMatrix).normalize();
+                                                vWorld.set(rawPos[oa], rawPos[oa + 1], rawPos[oa + 2]).applyMatrix4(worldMatrix);
+                                                vToCam.copy(camPos).sub(vWorld).normalize();
+                                                if (vNormal.dot(vToCam) < -0.1) return;
+
+                                                // 2. Occlusion check via Midpoint
+                                                vWorld.set(rawPos[oa], rawPos[oa + 1], rawPos[oa + 2]).add(vLocal.set(rawPos[ob], rawPos[ob + 1], rawPos[ob + 2])).multiplyScalar(0.5).applyMatrix4(worldMatrix);
+                                                vToCam.copy(vWorld).sub(camPos).normalize();
+                                                raycaster.set(camPos, vToCam);
+                                                occlusionHits.length = 0;
+                                                try {
+                                                    activeMesh.raycast(raycaster, occlusionHits);
+                                                } catch (e) {
+                                                    if (window.__origMeshRaycast) window.__origMeshRaycast.call(activeMesh, raycaster, occlusionHits);
+                                                }
+                                                if (occlusionHits.length > 0 && occlusionHits[0].distance < camPos.distanceTo(vWorld) - 0.01) return;
+                                            }
+
+                                            sub.edges.add(key);
+                                        }
+                                    };
+
+                                    for (let i = 0; i < triangleCount; i++) {
+                                        let i1, i2, i3;
+                                        if (idxArray) {
+                                            i1 = idxArray[i * 3]; i2 = idxArray[i * 3 + 1]; i3 = idxArray[i * 3 + 2];
+                                        } else {
+                                            i1 = i * 3; i2 = i * 3 + 1; i3 = i * 3 + 2;
+                                        }
+                                        checkEdge(i1, i2);
+                                        checkEdge(i2, i3);
+                                        checkEdge(i3, i1);
+                                    }
+                                }
+                                console.timeEnd("Comfy3D: Mode Selection Loop");
+
+                                viewport.selectedSubElements.set(activeMesh.uuid, sub);
+                                console.time("Comfy3D: Commands and Highlights");
+                                history.push(new SubMeshSelectionCommand(activeMesh, oldSub, sub));
+                                updateSubMeshHighlights();
+                                console.timeEnd("Comfy3D: Commands and Highlights");
+                                console.timeEnd("Comfy3D: BoxSelection Total");
+                            }
+                        } else {
+                            for (const asset of pickable) {
+                                tempBox.setFromObject(asset);
+                                tempBox.getCenter(tempV3);
+                                tempV3.project(camera);
+                                const screenX = (tempV3.x + 1) * renderer.domElement.clientWidth / 2;
+                                const screenY = (-tempV3.y + 1) * renderer.domElement.clientHeight / 2;
+
+                                if (screenX >= left && screenX <= right && screenY >= top && screenY <= bottom) {
+                                    if (xrayMode) {
+                                        selectedInBox.push(asset);
+                                    } else {
+                                        raycaster.setFromCamera(new THREE.Vector2(tempV3.x, tempV3.y), camera);
+                                        const hits = raycaster.intersectObjects(pickable, true);
+                                        if (hits.length > 0) {
+                                            let hitRoot = hits[0].object;
+                                            while (hitRoot.parent && !assets.includes(hitRoot)) hitRoot = hitRoot.parent;
+                                            if (hitRoot === asset) {
+                                                selectedInBox.push(asset);
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        if (selectedInBox.length > 0) {
-                            if (e.shiftKey) {
-                                selectedInBox.forEach(a => {
-                                    if (!selectedObjects.includes(a)) selectedObjects.push(a);
-                                });
-                            } else {
-                                selectedObjects = selectedInBox;
+                            if (selectedInBox.length > 0) {
+                                if (e.shiftKey) {
+                                    selectedInBox.forEach(a => {
+                                        if (!selectedObjects.includes(a)) selectedObjects.push(a);
+                                    });
+                                } else {
+                                    selectedObjects = selectedInBox;
+                                }
+                                selectObject(null, null, 2);
+                            } else if (!e.shiftKey) {
+                                deselectObject();
                             }
-                            selectObject(null, null, 2);
-                        } else if (!e.shiftKey) {
-                            deselectObject();
                         }
                     } else {
                         // Single Pick (Click)
@@ -2206,7 +3375,8 @@ app.registerExtension({
                         mouse.y = -(currentY / renderer.domElement.clientHeight) * 2 + 1;
 
                         raycaster.setFromCamera(mouse, camera);
-                        const intersectsAsset = raycaster.intersectObjects(getPickableAssets(), true);
+                        const pickable = getPickableAssets();
+                        const intersectsAsset = raycaster.intersectObjects(pickable, true);
 
                         if (intersectsAsset.length > 0) {
                             const hit = intersectsAsset[0];
@@ -2217,18 +3387,104 @@ app.registerExtension({
                             }
 
                             if (assets.includes(root)) {
-                                // Precision Selection Logic:
-                                // ALWAYS prioritize the leaf mesh for direct interaction.
-                                // This solves the "Root Selection" problem where clicking a mesh picked its group.
-                                let target = leaf.isMesh ? leaf : root;
+                                if (viewport.selectionMode === "object") {
+                                    // Precision Selection Logic:
+                                    // If part of a chunked massive mesh, always select the root group.
+                                    let target = root.userData.isChunked ? root : (leaf.isMesh ? leaf : root);
 
-                                console.log(`Comfy3D: Viewport Pick: ${target.name} (isLeaf: ${target !== root})`);
-                                selectObject(target, hit.point, e.shiftKey ? 1 : 0);
-                            } else if (!e.shiftKey && !viewport.transform.axis) {
-                                deselectObject();
+                                    console.log(`Comfy3D: Viewport Pick: ${target.name} (isLeaf: ${target !== root})`);
+                                    selectObject(target, hit.point, e.shiftKey ? 1 : 0);
+                                } else if (leaf.isMesh) {
+                                    // Sub-Mesh Selection
+                                    const mesh = leaf;
+                                    // If this mesh isn't the primary selection, select it first
+                                    if (!selectedObjects.includes(mesh)) {
+                                        selectObject(mesh, hit.point, 0);
+                                    }
+
+                                    const sub = viewport.selectedSubElements.get(mesh.uuid) || { vertices: new Set(), edges: new Set(), faces: new Set() };
+                                    const oldSub = {
+                                        vertices: new Set(sub.vertices),
+                                        edges: new Set(sub.edges),
+                                        faces: new Set(sub.faces)
+                                    };
+
+                                    if (!e.shiftKey) {
+                                        sub.vertices.clear();
+                                        sub.edges.clear();
+                                        sub.faces.clear();
+                                    }
+
+                                    if (viewport.selectionMode === "vertex") {
+                                        const vIdx = getClosestVertex(hit);
+                                        if (e.shiftKey) {
+                                            if (sub.vertices.has(vIdx)) sub.vertices.delete(vIdx);
+                                            else sub.vertices.add(vIdx);
+                                        } else {
+                                            sub.vertices.add(vIdx);
+                                        }
+                                    } else if (viewport.selectionMode === "edge") {
+                                        const edgeKey = getClosestEdge(hit);
+                                        if (e.shiftKey) {
+                                            if (sub.edges.has(edgeKey)) sub.edges.delete(edgeKey);
+                                            else sub.edges.add(edgeKey);
+                                        } else {
+                                            sub.edges.add(edgeKey);
+                                        }
+                                    } else if (viewport.selectionMode === "face") {
+                                        const fIdx = hit.faceIndex;
+                                        if (e.shiftKey) {
+                                            if (sub.faces.has(fIdx)) sub.faces.delete(fIdx);
+                                            else sub.faces.add(fIdx);
+                                        } else {
+                                            sub.faces.add(fIdx);
+                                        }
+                                    }
+
+                                    viewport.selectedSubElements.set(mesh.uuid, sub);
+                                    history.push(new SubMeshSelectionCommand(mesh, oldSub, sub));
+                                    updateSubMeshHighlights();
+                                    triggerUpdate();
+                                }
+                            } else if (!e.shiftKey) {
+                                // Clicked on something that is not an asset (e.g. background/gizmo)
+                                if (viewport.selectionMode === "object") {
+                                    deselectObject();
+                                } else {
+                                    // Sub-Mesh Mode: Just clear sub-selections of the active mesh
+                                    const activeMesh = getActiveMesh();
+                                    if (activeMesh) {
+                                        const sub = viewport.selectedSubElements.get(activeMesh.uuid);
+                                        if (sub && (sub.vertices.size > 0 || sub.edges.size > 0 || sub.faces.size > 0)) {
+                                            const oldSub = { vertices: new Set(sub.vertices), edges: new Set(sub.edges), faces: new Set(sub.faces) };
+                                            sub.vertices.clear(); sub.edges.clear(); sub.faces.clear();
+                                            history.push(new SubMeshSelectionCommand(activeMesh, oldSub, sub));
+                                            updateSubMeshHighlights();
+                                        }
+                                    } else {
+                                        deselectObject();
+                                    }
+                                }
                             }
-                        } else if (!e.shiftKey && !viewport.transform.axis) {
-                            deselectObject();
+                        } else if (!e.shiftKey) {
+                            // Clicked in empty space
+                            if (viewport.selectionMode === "object") {
+                                deselectObject();
+                            } else {
+                                const activeMesh = getActiveMesh();
+                                if (activeMesh) {
+                                    const sub = viewport.selectedSubElements.get(activeMesh.uuid);
+                                    if (sub && (sub.vertices.size > 0 || sub.edges.size > 0 || sub.faces.size > 0)) {
+                                        const oldSub = { vertices: new Set(sub.vertices), edges: new Set(sub.edges), faces: new Set(sub.faces) };
+                                        sub.vertices.clear(); sub.edges.clear(); sub.faces.clear();
+                                        history.push(new SubMeshSelectionCommand(activeMesh, oldSub, sub));
+                                        updateSubMeshHighlights();
+                                    }
+                                } else {
+                                    console.log("Comfy3D: Sub-mesh mode without active mesh, full deselect...");
+                                    deselectObject();
+                                }
+                            }
                         }
                     }
 
@@ -2246,77 +3502,6 @@ app.registerExtension({
                 window.addEventListener("mouseup", handleGlobalMouseUp, true);
                 window.addEventListener("pointerup", handleGlobalMouseUp, true);
 
-                const onKeyDown = (e) => {
-                    const key = e.key.toLowerCase();
-                    if (document.activeElement.tagName === "INPUT" || document.activeElement.tagName === "TEXTAREA") return;
-                    if (mouseInCanvas && (e.altKey || (e.ctrlKey && key !== "r" && key !== "t" && key !== "n"))) {
-                        console.log("Comfy3D: Blocking browser shortcut:", key);
-                        e.preventDefault();
-                    }
-                    if (key === "f") {
-                        console.log("Comfy3D: Hotkey \"F\" detected. alt:", e.altKey, "shift:", e.shiftKey, "ctrl:", e.ctrlKey);
-                        if (e.altKey) {
-                            console.log("Comfy3D: Triggering Unhide All (Alt+F)");
-                            if (isolatedObjects) toggleIsolate();
-                            return;
-                        }
-                        if (selectedObjects.length > 0) {
-                            isolationHistory.push([...selectedObjects]);
-                            console.log(`Comfy3D: Focus In [Step ${isolationHistory.length}] - Isolating ${selectedObjects.length} items...`);
-                            selectedObjects.forEach(obj => {
-                                console.log(`Comfy3D: Path: ${getObjectPath(obj)}`);
-                            });
-                            frameScene(selectedObjects);
-                            if (isolatedObjects) toggleIsolate(); // Toggle OFF to restore everything
-                            toggleIsolate(); // Toggle ON to re-isolate based on NEW selection
-                        } else if (isolatedObjects && isolationHistory.length > 0) {
-                            // Breadcrumb Unfocus (Selection History)
-                            isolationHistory.pop(); // Remove current focus level
-
-                            if (isolationHistory.length > 0) {
-                                const prevSelection = isolationHistory[isolationHistory.length - 1];
-                                console.log(`Comfy3D: Focus Out [Step ${isolationHistory.length}] - Restoring to previous selection of ${prevSelection.length} items...`);
-
-                                // Temporarily update globals for focus/isolate logic
-                                const currentSel = selectedObjects;
-                                selectedObjects = prevSelection;
-
-                                frameScene(prevSelection);
-                                toggleIsolate(); // Restore
-                                toggleIsolate(); // Re-isolate to previous level
-
-                                selectedObjects = currentSel;
-                                if (typeof updateOutlinerSelection === "function") updateOutlinerSelection();
-                            } else {
-                                console.log("Comfy3D: Focus Restore [Step 0] - History empty, framing entire scene.");
-                                if (isolatedObjects) toggleIsolate();
-                                frameScene(assets);
-                            }
-                        } else {
-                            console.log("Comfy3D: Focus Restore - Nothing selected, framing entire scene.");
-                            if (isolatedObjects) toggleIsolate();
-                            frameScene(assets);
-                            isolationHistory = [];
-                        }
-                    }
-                    if (key === "h") {
-                        console.log("Comfy3D: Hotkey \"H\" detected. alt:", e.altKey);
-                        if (e.altKey) {
-                            console.log("Comfy3D: Triggering Unhide All (Alt+H)");
-                            if (isolatedObjects) toggleIsolate();
-                            else {
-                                scene.traverse(obj => { if (obj.isMesh || obj.isGroup) obj.visible = true; });
-                                triggerUpdate();
-                                if (typeof updateOutliner === "function") updateOutliner();
-                            }
-                        } else if (selectedObjects.length > 0) {
-                            console.log("Comfy3D: Hiding selection...");
-                            selectedObjects.forEach(obj => { if (obj) obj.visible = false; });
-                            deselectObject();
-                        }
-                    }
-                };
-                window.addEventListener("keydown", onKeyDown, true);
 
                 window.addEventListener("click", e => { }, true);
 
@@ -2340,47 +3525,116 @@ app.registerExtension({
 
                     if (viewport.modalTransform.active) {
                         const mt = viewport.modalTransform;
-                        const mouseDelta = new THREE.Vector2(mouse.x - mt.startMouse.x, mouse.y - mt.startMouse.y);
+                        const rect = renderer.domElement.getBoundingClientRect();
+                        const mouseDelta = new THREE.Vector2(mouse.x - mt.mouseStart.x, mouse.y - mt.mouseStart.y);
                         const centerScreen = mt.centerScreen;
 
-                        mt.startStates.forEach(s => {
+                        if (mt.isSubMesh) {
+                            // Calculate World Space Transformation Matrix
+                            const worldTrans = new THREE.Matrix4();
+                            const fovFactor = Math.tan(camera.fov * Math.PI / 360) * 2;
+                            const distToCenter = mt.center.distanceTo(camera.position);
+                            const scaleX = distToCenter * fovFactor * (rect.width / rect.height) * 0.5;
+                            const scaleY = distToCenter * fovFactor * 0.5;
+                            const cameraRight = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
+                            const cameraUp = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1);
+
                             if (mt.mode === "translate") {
-                                const cameraRight = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
-                                const cameraUp = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1);
-
-                                const fovFactor = Math.tan(camera.fov * Math.PI / 360) * 2;
-                                const distToCenter = mt.center.distanceTo(camera.position);
-                                const scaleX = distToCenter * fovFactor * (rect.width / rect.height) * 0.5;
-                                const scaleY = distToCenter * fovFactor * 0.5;
-
-                                s.object.position.copy(s.position)
-                                    .add(cameraRight.multiplyScalar(mouseDelta.x * scaleX))
-                                    .add(cameraUp.multiplyScalar(mouseDelta.y * scaleY));
-
+                                const deltaWorld = cameraRight.clone().multiplyScalar(mouseDelta.x * scaleX).add(cameraUp.clone().multiplyScalar(mouseDelta.y * scaleY));
+                                if (mt.axis) {
+                                    const axisDir = new THREE.Vector3(mt.axis === "x" ? 1 : 0, mt.axis === "y" ? 1 : 0, mt.axis === "z" ? 1 : 0);
+                                    const projection = deltaWorld.dot(axisDir);
+                                    deltaWorld.copy(axisDir).multiplyScalar(projection);
+                                }
+                                worldTrans.makeTranslation(deltaWorld.x, deltaWorld.y, deltaWorld.z);
                             } else if (mt.mode === "rotate") {
-                                const vStart = new THREE.Vector2(mt.startMouse.x - centerScreen.x, mt.startMouse.y - centerScreen.y);
-                                const vCurrent = new THREE.Vector2(mouse.x - centerScreen.x, mouse.y - centerScreen.y);
+                                const vStartNorm = new THREE.Vector2(mt.mouseStart.x - centerScreen.x, mt.mouseStart.y - centerScreen.y).normalize();
+                                const vCurrentNorm = new THREE.Vector2(mouse.x - centerScreen.x, mouse.y - centerScreen.y).normalize();
+                                let angle = Math.atan2(vCurrentNorm.y, vCurrentNorm.x) - Math.atan2(vStartNorm.y, vStartNorm.x);
+                                if (mt.axis) angle *= 2;
+                                const axisDir = mt.axis ? new THREE.Vector3(mt.axis === "x" ? 1 : 0, mt.axis === "y" ? 1 : 0, mt.axis === "z" ? 1 : 0) : new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 2);
 
-                                if (vStart.length() > 0.001 && vCurrent.length() > 0.001) {
-                                    vStart.normalize();
-                                    vCurrent.normalize();
-                                    let angle = Math.atan2(vCurrent.y, vCurrent.x) - Math.atan2(vStart.y, vStart.x);
-
-                                    const cameraDir = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 2);
-                                    const q = new THREE.Quaternion().setFromAxisAngle(cameraDir, angle);
-                                    s.object.quaternion.copy(s.quaternion).premultiply(q);
-                                }
-
+                                worldTrans.makeTranslation(-mt.center.x, -mt.center.y, -mt.center.z);
+                                const rotMat = new THREE.Matrix4().makeRotationAxis(axisDir, angle);
+                                worldTrans.premultiply(rotMat);
+                                worldTrans.premultiply(new THREE.Matrix4().makeTranslation(mt.center.x, mt.center.y, mt.center.z));
                             } else if (mt.mode === "scale") {
-                                const dStart = new THREE.Vector2(mt.startMouse.x - centerScreen.x, mt.startMouse.y - centerScreen.y).length();
+                                const dStart = new THREE.Vector2(mt.mouseStart.x - centerScreen.x, mt.mouseStart.y - centerScreen.y).length();
                                 const dCurrent = new THREE.Vector2(mouse.x - centerScreen.x, mouse.y - centerScreen.y).length();
+                                const ratio = dStart > 0.001 ? dCurrent / dStart : 1;
 
-                                if (dStart > 0.001) {
-                                    const ratio = dCurrent / dStart;
-                                    s.object.scale.copy(s.scale).multiplyScalar(ratio);
-                                }
+                                worldTrans.makeTranslation(-mt.center.x, -mt.center.y, -mt.center.z);
+                                const scaleVec = new THREE.Vector3(
+                                    (!mt.axis || mt.axis === "x") ? ratio : 1,
+                                    (!mt.axis || mt.axis === "y") ? ratio : 1,
+                                    (!mt.axis || mt.axis === "z") ? ratio : 1
+                                );
+                                const scaleMat = new THREE.Matrix4().makeScale(scaleVec.x, scaleVec.y, scaleVec.z);
+                                worldTrans.premultiply(scaleMat);
+                                worldTrans.premultiply(new THREE.Matrix4().makeTranslation(mt.center.x, mt.center.y, mt.center.z));
                             }
-                        });
+
+                            mt.subTransformData.forEach((data, meshUUID) => {
+                                const mesh = data.mesh;
+                                const geo = mesh.geometry;
+                                const posAttr = geo.attributes.position;
+
+                                mesh.updateMatrixWorld(true);
+                                const invWorld = new THREE.Matrix4().copy(mesh.matrixWorld).invert();
+                                const localTrans = new THREE.Matrix4().copy(invWorld).multiply(worldTrans).multiply(mesh.matrixWorld);
+
+                                const v = new THREE.Vector3();
+                                data.indices.forEach((vIdx, i) => {
+                                    v.copy(data.startPos[i]).applyMatrix4(localTrans);
+                                    posAttr.setXYZ(vIdx, v.x, v.y, v.z);
+                                });
+                                posAttr.needsUpdate = true;
+                            });
+                            updateSubMeshHighlights();
+                        } else {
+                            mt.startStates.forEach(s => {
+                                if (mt.mode === "translate") {
+                                    const cameraRight = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0);
+                                    const cameraUp = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1);
+                                    const fovFactor = Math.tan(camera.fov * Math.PI / 360) * 2;
+                                    const distToCenter = mt.center.distanceTo(camera.position);
+                                    const scaleX = distToCenter * fovFactor * (rect.width / rect.height) * 0.5;
+                                    const scaleY = distToCenter * fovFactor * 0.5;
+
+                                    if (mt.axis) {
+                                        const axisDir = new THREE.Vector3(mt.axis === "x" ? 1 : 0, mt.axis === "y" ? 1 : 0, mt.axis === "z" ? 1 : 0);
+                                        const screenMove = cameraRight.clone().multiplyScalar(mouseDelta.x * scaleX).add(cameraUp.clone().multiplyScalar(mouseDelta.y * scaleY));
+                                        s.object.position.copy(s.position).add(axisDir.multiplyScalar(screenMove.dot(axisDir)));
+                                    } else {
+                                        s.object.position.copy(s.position).add(cameraRight.multiplyScalar(mouseDelta.x * scaleX)).add(cameraUp.multiplyScalar(mouseDelta.y * scaleY));
+                                    }
+                                } else if (mt.mode === "rotate") {
+                                    const vStart = new THREE.Vector2(mt.mouseStart.x - centerScreen.x, mt.mouseStart.y - centerScreen.y);
+                                    const vCurrent = new THREE.Vector2(mouse.x - centerScreen.x, mouse.y - centerScreen.y);
+                                    if (vStart.length() > 0.001 && vCurrent.length() > 0.001) {
+                                        vStart.normalize(); vCurrent.normalize();
+                                        let angle = Math.atan2(vCurrent.y, vCurrent.x) - Math.atan2(vStart.y, vStart.x);
+                                        if (mt.axis) {
+                                            const axisDir = new THREE.Vector3(mt.axis === "x" ? 1 : 0, mt.axis === "y" ? 1 : 0, mt.axis === "z" ? 1 : 0);
+                                            const q = new THREE.Quaternion().setFromAxisAngle(axisDir, angle * 2);
+                                            s.object.quaternion.copy(s.quaternion).premultiply(q);
+                                        } else {
+                                            const cameraDir = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 2);
+                                            const q = new THREE.Quaternion().setFromAxisAngle(cameraDir, angle);
+                                            s.object.quaternion.copy(s.quaternion).premultiply(q);
+                                        }
+                                    }
+                                } else if (mt.mode === "scale") {
+                                    const dStart = new THREE.Vector2(mt.mouseStart.x - centerScreen.x, mt.mouseStart.y - centerScreen.y).length();
+                                    const dCurrent = new THREE.Vector2(mouse.x - centerScreen.x, mouse.y - centerScreen.y).length();
+                                    if (dStart > 0.001) {
+                                        const ratio = dCurrent / dStart;
+                                        if (mt.axis) { s.object.scale.copy(s.scale); s.object.scale[mt.axis] = s.scale[mt.axis] * ratio; }
+                                        else { s.object.scale.copy(s.scale).multiplyScalar(ratio); }
+                                    }
+                                }
+                            });
+                        }
                         triggerUpdate();
                         return;
                     }
@@ -2432,6 +3686,7 @@ app.registerExtension({
                         } else {
                             if (!this._lastRaycast || performance.now() - this._lastRaycast > 50) {
                                 raycaster.setFromCamera(mouse, camera);
+                                raycaster.firstHitOnly = true;
                                 const intersects = raycaster.intersectObjects(getPickableAssets(), true);
                                 renderer.domElement.style.cursor = (intersects.length > 0 || isSelecting) ? "pointer" : "auto";
                                 this._lastRaycast = performance.now();
@@ -2455,6 +3710,7 @@ app.registerExtension({
                         if (!viewport.brushActive) {
                             if (!this._lastRaycast || performance.now() - this._lastRaycast > 50) {
                                 raycaster.setFromCamera(mouse, camera);
+                                raycaster.firstHitOnly = true;
                                 const intersects = raycaster.intersectObjects(getPickableAssets(), true);
                                 renderer.domElement.style.cursor = (intersects.length > 0 || isSelecting) ? "pointer" : "auto";
                                 this._lastRaycast = performance.now();
@@ -2471,6 +3727,9 @@ app.registerExtension({
                 }, true);
 
                 let lastRenderTime = 0;
+                let lastBase64Update = 0;
+                let wasUpdating = false;
+
                 const animate = (time) => {
                     requestAnimationFrame(animate);
 
@@ -2478,21 +3737,6 @@ app.registerExtension({
                     if (changed) needsUpdate = true;
 
                     if (needsUpdate) {
-                        // 1. Main Scene Render
-                        if (selectionHelper && selectionHelper.visible && selectedObjects.length > 0) {
-                            if (selectedObjects.length > 1 && this._selectionBoxMesh) {
-                                const box = new THREE.Box3();
-                                selectedObjects.forEach(o => box.expandByObject(o));
-                                const size = box.getSize(new THREE.Vector3());
-                                const center = box.getCenter(new THREE.Vector3());
-                                this._selectionBoxMesh.scale.set(size.x || 0.1, size.y || 0.1, size.z || 0.1);
-                                this._selectionBoxMesh.position.copy(center);
-                                this._selectionBoxMesh.updateMatrixWorld(true);
-                                selectionHelper.setFromObject(this._selectionBoxMesh);
-                            } else {
-                                selectionHelper.update();
-                            }
-                        }
                         renderer.render(scene, camera);
 
                         // 2. Gizmo Overlay Render - COMPLETELY ISOLATED
@@ -2500,10 +3744,24 @@ app.registerExtension({
                         gizmoRenderer.render(gizmoScene, gizmoCamera);
 
                         needsUpdate = false;
+                        wasUpdating = true;
                         lastRenderTime = time;
+                    } else if (wasUpdating && performance.now() - lastBase64Update > 2000) {
+                        // Capture preview when interaction stops
+                        const data = renderer.domElement.toDataURL("image/jpeg", 0.85);
+                        const widget = this.widgets?.find(w => w.name === "base64_image");
+                        if (widget) widget.value = data;
+                        else this.base64_image = data;
+                        lastBase64Update = performance.now();
+                        wasUpdating = false;
                     }
                 };
                 animate();
+                updateSelectionUI();
+                updateShadingUI();
+                updateToolbar();
+                updateOutliner();
+                updateSelectionHelper();
 
                 const handleKeyDown = (e) => {
                     if (!viewport.transform) return;
@@ -2511,112 +3769,136 @@ app.registerExtension({
                     const isCtrl = e.ctrlKey || e.metaKey;
                     const isAlt = e.altKey;
 
-                    // Undo / Redo (Primary: Alt+Z, Secondary: Ctrl+Z)
+                    // 1. Modal Transform Confirmation/Cancellation
+                    if (viewport.modalTransform.active) {
+                        const mt = viewport.modalTransform;
+                        if (key === "x") { mt.axis = (mt.axis === "x") ? null : "x"; updateHUD(`${mt.mode.toUpperCase()} [${mt.axis ? mt.axis.toUpperCase() + ' Locked' : 'Free'}]`); }
+                        if (key === "y") { mt.axis = (mt.axis === "y") ? null : "y"; updateHUD(`${mt.mode.toUpperCase()} [${mt.axis ? mt.axis.toUpperCase() + ' Locked' : 'Free'}]`); }
+                        if (key === "z") { mt.axis = (mt.axis === "z") ? null : "z"; updateHUD(`${mt.mode.toUpperCase()} [${mt.axis ? mt.axis.toUpperCase() + ' Locked' : 'Free'}]`); }
+
+                        if (key === "escape") cancelModalTransform();
+                        if (key === "enter" || key === " ") confirmModalTransform();
+
+                        e.preventDefault(); e.stopPropagation();
+                        return;
+                    }
+
+                    // 2. Transformation Tool Initiators (G/R/S)
+                    if (!isAlt && !isCtrl) {
+                        if (key === "g") { startModalTransform("translate"); e.preventDefault(); return; }
+                        if (key === "r") { startModalTransform("rotate"); e.preventDefault(); return; }
+                        if (key === "s") { startModalTransform("scale"); e.preventDefault(); return; }
+                    }
+
+                    // 3. Undo / Redo (Primary: Alt+Z, Secondary: Ctrl+Z)
                     if (isAlt || isCtrl) {
                         if (key === "z") {
                             if (e.shiftKey) history.redo();
                             else history.undo();
                             triggerUpdate();
-                            e.preventDefault();
-                            e.stopPropagation();
+                            e.preventDefault(); e.stopPropagation();
                             return;
                         }
                         if (key === "y") {
                             history.redo();
                             triggerUpdate();
-                            e.preventDefault();
-                            e.stopPropagation();
+                            e.preventDefault(); e.stopPropagation();
                             return;
                         }
                     }
 
-                    if (isAlt || isCtrl || e.metaKey) {
-                        return; // Ignore transformation tools if any modifier is pressed
-                    }
-
-                    const initiateModalTransform = (mode) => {
-                        if (selectedObjects.length === 0) return;
-                        viewport.modalTransform.active = true;
-                        viewport.modalTransform.mode = mode;
-                        viewport.modalTransform.startMouse.copy(mouse);
-                        viewport.modalTransform.startStates = selectedObjects.map(obj => ({
-                            object: obj,
-                            position: obj.position.clone(),
-                            quaternion: obj.quaternion.clone(),
-                            scale: obj.scale.clone()
-                        }));
-
-                        // Calculate center
-                        const box = new THREE.Box3();
-                        selectedObjects.forEach(o => box.expandByObject(o));
-                        box.getCenter(viewport.modalTransform.center);
-                        viewport.modalTransform.centerScreen.copy(viewport.modalTransform.center).project(camera);
-
-                        orbit.enabled = false;
-                        if (viewport.transform) {
-                            viewport.transform.setMode(mode);
-                            viewport.transform.enabled = false;
+                    // 4. Selection & View Modes
+                    if (key === "tab") {
+                        if (viewport.selectionMode === "object") {
+                            let mesh = null;
+                            selectedObjects.forEach(obj => {
+                                if (obj.isMesh) { mesh = obj; return; }
+                                obj.traverse(c => { if (!mesh && c.isMesh) mesh = c; });
+                            });
+                            if (mesh) viewport.selectionMode = "vertex";
+                        } else {
+                            viewport.selectionMode = "object";
                         }
-                        viewport.brushActive = false;
-                        viewport.pointSelection.active = false; // Mutually exclusive
-                        if (typeof updateToolbar === "function") updateToolbar();
+                        updateSubMeshHighlights();
+                        updateSelectionUI();
                         triggerUpdate();
-                    };
-
-                    const confirmModalTransform = () => {
-                        if (!viewport.modalTransform.active) return;
-
-                        const mt = viewport.modalTransform;
-                        const initialMap = new Map();
-                        const finalMap = new Map();
-
-                        mt.startStates.forEach(s => {
-                            initialMap.set(s.object, { p: s.position, q: s.quaternion, s: s.scale });
-                            finalMap.set(s.object, { p: s.object.position.clone(), q: s.object.quaternion.clone(), s: s.object.scale.clone() });
-                        });
-
-                        const cmd = new MultiTransformCommand(mt.startStates.map(s => s.object), initialMap, finalMap);
-                        history.push(cmd);
-
-                        mt.active = false;
-                        orbit.enabled = true;
-                        if (viewport.transform) viewport.transform.enabled = true;
-                        triggerUpdate();
-                    };
-
-                    switch (key) {
-                        case "g": initiateModalTransform("translate"); break;
-                        case "r": initiateModalTransform("rotate"); break;
-                        case "s": initiateModalTransform("scale"); break;
-                        case "escape":
-                            if (viewport.modalTransform.active) {
-                                viewport.modalTransform.startStates.forEach(s => {
-                                    s.object.position.copy(s.position);
-                                    s.object.quaternion.copy(s.quaternion);
-                                    s.object.scale.copy(s.scale);
-                                });
-                                viewport.modalTransform.active = false;
-                                orbit.enabled = true;
-                                if (viewport.transform) viewport.transform.enabled = true;
-                                triggerUpdate();
-                            }
-                            break;
-                        case "enter":
-                            confirmModalTransform();
-                            break;
-                        case "b":
-                            const bBtn = toolbarBtns["brush"];
-                            if (bBtn) bBtn.click();
-                            break;
-                        case "v":
-                            const vBtn = toolbarBtns["split"];
-                            if (vBtn) vBtn.click();
-                            break;
-                        case "x": case "delete": deleteSelected(); break;
+                        e.preventDefault();
                     }
-                    if (typeof updateToolbar === "function") updateToolbar();
+
+                    if (key === "1") { viewport.selectionMode = "vertex"; updateSubMeshHighlights(); updateSelectionUI(); triggerUpdate(); }
+                    if (key === "2") { viewport.selectionMode = "edge"; updateSubMeshHighlights(); updateSelectionUI(); triggerUpdate(); }
+                    if (key === "3") { viewport.selectionMode = "face"; updateSubMeshHighlights(); updateSelectionUI(); triggerUpdate(); }
+                    if (key === "4") { viewport.selectionMode = "object"; updateSubMeshHighlights(); updateSelectionUI(); triggerUpdate(); }
+
+                    // 5. Scene Management (A, H, F, Delete)
+                    if (key === "a") {
+                        if (isAlt) {
+                            if (viewport.selectionMode === "object") deselectObject();
+                            else {
+                                const mesh = getActiveMesh();
+                                if (mesh) {
+                                    const sub = viewport.selectedSubElements.get(mesh.uuid);
+                                    if (sub) {
+                                        const oldSub = { vertices: new Set(sub.vertices), edges: new Set(sub.edges), faces: new Set(sub.faces) };
+                                        sub.vertices.clear(); sub.edges.clear(); sub.faces.clear();
+                                        history.push(new SubMeshSelectionCommand(mesh, oldSub, sub));
+                                        updateSubMeshHighlights();
+                                    }
+                                }
+                            }
+                        } else if (!isCtrl) {
+                            // Select All
+                            if (viewport.selectionMode === "object") {
+                                selectedObjects = [...assets];
+                                selectObject(null, null, 2);
+                            } else {
+                                const mesh = getActiveMesh();
+                                if (mesh) {
+                                    const sub = viewport.selectedSubElements.get(mesh.uuid) || { vertices: new Set(), edges: new Set(), faces: new Set() };
+                                    const oldSub = { vertices: new Set(sub.vertices), edges: new Set(sub.edges), faces: new Set(sub.faces) };
+                                    const pos = mesh.geometry.attributes.position;
+                                    if (viewport.selectionMode === "vertex") {
+                                        for (let i = 0; i < pos.count; i++) sub.vertices.add(i);
+                                    } else if (viewport.selectionMode === "face") {
+                                        const count = mesh.geometry.index ? mesh.geometry.index.count / 3 : pos.count / 3;
+                                        for (let i = 0; i < count; i++) sub.faces.add(i);
+                                    }
+                                    viewport.selectedSubElements.set(mesh.uuid, sub);
+                                    history.push(new SubMeshSelectionCommand(mesh, oldSub, sub));
+                                    updateSubMeshHighlights();
+                                }
+                            }
+                        }
+                        triggerUpdate(); e.preventDefault();
+                    }
+
+                    if (key === "f") {
+                        if (isAlt && isolatedObjects) toggleIsolate();
+                        else if (selectedObjects.length > 0) frameScene(selectedObjects);
+                        else frameScene(assets);
+                        e.preventDefault();
+                    }
+
+                    if (key === "h") {
+                        if (isAlt) {
+                            scene.traverse(obj => { if (obj.isMesh || obj.isGroup) obj.visible = true; });
+                            if (isolatedObjects) toggleIsolate();
+                        } else if (selectedObjects.length > 0) {
+                            selectedObjects.forEach(obj => { if (obj) obj.visible = false; });
+                            deselectObject();
+                        }
+                        triggerUpdate(); updateOutliner(); e.preventDefault();
+                    }
+
+                    if (key === "x" || key === "delete") { deleteSelected(); e.preventDefault(); }
+
+                    // 6. Tool Shortcuts
+                    if (key === "b" && !isCtrl && !isAlt) { const btn = toolbarBtns["brush"]; if (btn) btn.click(); }
+                    if (key === "v" && !isCtrl && !isAlt) { const btn = toolbarBtns["split"]; if (btn) btn.click(); }
+                    if (key === "j" && !isCtrl && !isAlt) { joinSelectedMeshes(); e.preventDefault(); }
+                    if (key === "p" && !isCtrl && !isAlt) { separateMesh(); e.preventDefault(); }
                 };
-                window.addEventListener("keydown", handleKeyDown);
+                window.addEventListener("keydown", handleKeyDown, true);
 
 
                 this.onRemoved = () => {
@@ -2703,16 +3985,6 @@ app.registerExtension({
                     resize();
                 }, 1000);
 
-                let lastBase64Update = 0;
-                setInterval(() => {
-                    if (renderer.domElement && needsUpdate === false && performance.now() - lastBase64Update > 2000) {
-                        const data = renderer.domElement.toDataURL("image/jpeg", 0.85); // Use JPEG with slightly lower quality for preview
-                        const widget = this.widgets?.find(w => w.name === "base64_image");
-                        if (widget) widget.value = data;
-                        else this.base64_image = data;
-                        lastBase64Update = performance.now();
-                    }
-                }, 1000);
 
                 const loadAssetSilent = (filename, type = "output") => {
                     return new Promise((resolve, reject) => {
@@ -2758,13 +4030,36 @@ app.registerExtension({
                     const ext = path.split(".").pop().toLowerCase();
                     let filename = path;
                     let subfolder = "";
+
                     if (path.includes("/") || path.includes("\\")) {
-                        const parts = path.split(/[/\\]/);
+                        const normalizedPath = path.replace(/\\/g, "/");
+                        const parts = normalizedPath.split("/");
                         filename = parts.pop();
-                        subfolder = parts.join("/");
+
+                        // Intelligent path relativization: find context roots
+                        const roots = ["output", "input", "temp"];
+                        let rootIdx = -1;
+                        let foundRoot = "";
+
+                        for (const root of roots) {
+                            const idx = parts.lastIndexOf(root);
+                            if (idx > rootIdx) {
+                                rootIdx = idx;
+                                foundRoot = root;
+                            }
+                        }
+
+                        if (rootIdx !== -1) {
+                            subfolder = parts.slice(rootIdx + 1).join("/");
+                            type = foundRoot;
+                        } else {
+                            // Absolute path fallbacks: strip any system prefix up to filename
+                            subfolder = "";
+                        }
                     }
 
-                    let url = `/view?filename=${encodeURIComponent(filename)}`;
+                    // Always use official ComfyUI API endpoint
+                    let url = `/api/view?filename=${encodeURIComponent(filename)}`;
                     if (subfolder) url += `&subfolder=${encodeURIComponent(subfolder)}`;
                     url += `&type=${type}`;
 

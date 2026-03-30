@@ -206,7 +206,7 @@ def trimesh_texture_split(mesh_path, quantization_steps=16.0):
         part_idx += 1
 
     out_filename = f"studio_split_{uuid.uuid4().hex}.glb"
-    out_path = os.path.join(folder_paths.get_output_directory(), out_filename)
+    out_path = os.path.join(folder_paths.get_temp_directory(), out_filename)
     scene_out.export(out_path)
     return out_path
 
@@ -241,7 +241,7 @@ async def split_mesh_api(request):
         
         return web.json_response({
             "filename": res_filename,
-            "type": "output",
+            "type": "temp",
             "full_path": result_path
         })
     except Exception as e:
@@ -253,13 +253,21 @@ async def join_mesh_api(request):
         import trimesh
         import uuid
         data = await request.json()
-        filenames = data.get("filenames", [])
+        entries = data.get("entries", []) # List of {filename: str, meshes: [str]}
+        filenames = data.get("filenames", []) # Fallback for old style
         
-        if not filenames:
+        if not entries and not filenames:
             return web.json_response({"error": "No filenames provided for joining"}, status=400)
 
+        # Normalize old filenames list to entries
+        if not entries:
+            entries = [{"filename": f} for f in filenames]
+
         all_geometries = []
-        for filename in filenames:
+        for entry in entries:
+            filename = entry.get("filename")
+            target_meshes = entry.get("meshes") # Optional list of names
+            
             # Resolve path
             path = filename
             if not os.path.isabs(path):
@@ -276,34 +284,52 @@ async def join_mesh_api(request):
             if os.path.exists(path):
                 # Load current mesh
                 scene = trimesh.load(path, force='scene')
-                for geom in scene.geometry.values():
-                    all_geometries.append(geom)
+                # If the file only has one mesh, and we specify target_meshes, 
+                # it's very likely the user wants this mesh (e.g. previously merged mesh).
+                nodes_with_geom = list(scene.graph.nodes_geometry)
+                force_all = len(nodes_with_geom) == 1
+                
+                for node_name in nodes_with_geom:
+                    match = target_meshes is None or (isinstance(target_meshes, list) and node_name in target_meshes)
+                    if match or force_all:
+                        # Get world transform and geometry name for this node from the graph tuple
+                        transform, geom_name = scene.graph[node_name]
+                        if geom_name in scene.geometry:
+                            print(f"[Comfy3D Join] Adding transformed geometry: {node_name} (match={match}, force={force_all})")
+                            geom = scene.geometry[geom_name].copy()
+                            geom.apply_transform(transform)
+                            all_geometries.append(geom)
+                        else:
+                            print(f"[Comfy3D Join] Geometry not found for node: {node_name}")
+                    else:
+                        print(f"[Comfy3D Join] Skipping node: {node_name} (no match in {target_meshes})")
 
         if not all_geometries:
             return web.json_response({"error": "No valid geometry found in provided files"}, status=400)
 
-        # Create a new scene containing all geometries
-        scene_out = trimesh.Scene()
-        for i, geom in enumerate(all_geometries):
+        # True Merge: Concatenate all geometries into a single mesh
+        # Clean up geometries before concatenating
+        proc_geoms = []
+        for geom in all_geometries:
             try:
-                # Clean up before joining to prevent NaN accumulation
                 geom.remove_unreferenced_vertices()
-                if np.isnan(geom.vertices).any():
+                if hasattr(geom, 'vertices') and np.isnan(geom.vertices).any():
                     valid_verts = ~np.isnan(geom.vertices).any(axis=1)
-                    if not valid_verts.all():
-                        geom.update_vertices(valid_verts)
+                    geom.update_vertices(valid_verts)
                 geom.process(validate=True)
             except:
                 pass
-            scene_out.add_geometry(geom, geom_name=f"part_{i}")
+            proc_geoms.append(geom)
 
-        out_filename = f"studio_joined_{uuid.uuid4().hex}.glb"
-        out_path = os.path.join(folder_paths.get_output_directory(), out_filename)
-        scene_out.export(out_path)
+        merged_mesh = trimesh.util.concatenate(proc_geoms)
+        
+        out_filename = f"studio_merged_{uuid.uuid4().hex}.glb"
+        out_path = os.path.join(folder_paths.get_temp_directory(), out_filename)
+        merged_mesh.export(out_path)
         
         return web.json_response({
             "filename": out_filename,
-            "type": "output",
+            "type": "temp",
             "full_path": out_path
         })
     except Exception as e:
