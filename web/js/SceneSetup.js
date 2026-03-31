@@ -25,10 +25,65 @@ export class SceneSetup {
         // Scene & Camera
         // ------------------------------------------------------------------
         this.scene = new THREE.Scene();
-        this.scene.background = new THREE.Color(0x1a1a1a);
+        this.scene.background = new THREE.Color(0x0a0a0a);
 
         this.camera = new THREE.PerspectiveCamera(50, 1, 0.1, 1000);
         this.camera.position.set(5, 5, 5);
+
+        // ── Groups and Proxies ───────────────────────────────────────
+        this.pointsGroup = new THREE.Group();
+        this.scene.add(this.pointsGroup);
+
+        this.selectionProxy = new THREE.Object3D();
+        this.selectionProxy.name = "SelectionProxy";
+        this.scene.add(this.selectionProxy);
+
+        // Orange bounding-box outline
+        this.selectionHelper = new THREE.Group();
+        this.selectionWireframe = new THREE.LineSegments(
+            new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
+            new THREE.LineBasicMaterial({ color: 0xff9500, linewidth: 2.5, transparent: true, opacity: 0.8 })
+        );
+        this.selectionHelper.add(this.selectionWireframe);
+        this.selectionHelper.visible = false;
+        this.scene.add(this.selectionHelper);
+
+        // Sub-mesh highlight overlays
+        this.vertexHighlight = new THREE.Points(
+            new THREE.BufferGeometry(),
+            new THREE.PointsMaterial({ color: 0xff9500, size: 6, sizeAttenuation: false, depthTest: false, transparent: true })
+        );
+        this.vertexHighlight.renderOrder = 999;
+        this.scene.add(this.vertexHighlight);
+
+        this.edgeHighlight = new THREE.LineSegments(
+            new THREE.BufferGeometry(),
+            new THREE.LineBasicMaterial({ color: 0xff9500, linewidth: 2, depthTest: false, transparent: true })
+        );
+        this.edgeHighlight.renderOrder = 998;
+        this.scene.add(this.edgeHighlight);
+
+        // Persistent background overlays (Blender look)
+        this.persistentVertexPoints = new THREE.Points(
+            new THREE.BufferGeometry(),
+            new THREE.PointsMaterial({ color: 0x000000, size: 5, sizeAttenuation: false, depthTest: true, transparent: true, opacity: 1.0 })
+        );
+        this.persistentVertexPoints.renderOrder = 991;
+        this.scene.add(this.persistentVertexPoints);
+
+        this.persistentWireframe = new THREE.LineSegments(
+            new THREE.BufferGeometry(),
+            new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 1, transparent: true, opacity: 0.5, depthTest: true })
+        );
+        this.persistentWireframe.renderOrder = 990;
+        this.scene.add(this.persistentWireframe);
+
+        this.faceHighlight = new THREE.Mesh(
+            new THREE.BufferGeometry(),
+            new THREE.MeshBasicMaterial({ color: 0xff9500, side: THREE.DoubleSide, transparent: true, opacity: 0.4, depthTest: false })
+        );
+        this.faceHighlight.renderOrder = 997;
+        this.scene.add(this.faceHighlight);
 
         // ------------------------------------------------------------------
         // Main Renderer
@@ -57,7 +112,7 @@ export class SceneSetup {
 
         this.renderer.domElement.addEventListener("webglcontextrestored", () => {
             console.log("Comfy3D: WebGL Context Restored.");
-            this.renderer.setClearColor(0x1a1a1a, 1);
+            this.renderer.setClearColor(0x0a0a0a, 1);
             if (this._onContextRestored) this._onContextRestored();
         }, false);
 
@@ -101,6 +156,21 @@ export class SceneSetup {
             </style>
         `;
         canvasArea.appendChild(this.loadingOverlay);
+
+        // ── Helper DOM Elements ──────────────────────────────────────
+        this.selectionRect = document.createElement("div");
+        Object.assign(this.selectionRect.style, {
+            position: "absolute", border: "1px dashed #ff9500",
+            backgroundColor: "rgba(255,149,0,0.1)", display: "none", pointerEvents: "none", zIndex: "100"
+        });
+        canvasArea.appendChild(this.selectionRect);
+
+        this.brushCursor = document.createElement("div");
+        Object.assign(this.brushCursor.style, {
+            position: "absolute", borderRadius: "50%", border: "2px solid rgba(255,149,0,0.5)",
+            display: "none", pointerEvents: "none", zIndex: "100", transform: "translate(-50%, -50%)"
+        });
+        canvasArea.appendChild(this.brushCursor);
 
         // ------------------------------------------------------------------
         // Grid Plane (shader-based)
@@ -160,20 +230,20 @@ export class SceneSetup {
         const xAxisGeom = new THREE.BufferGeometry().setFromPoints([
             new THREE.Vector3(-50, 0, 0), new THREE.Vector3(50, 0, 0)
         ]);
-        const xAxis = new THREE.Line(
+        this.xAxis = new THREE.Line(
             xAxisGeom,
             new THREE.LineBasicMaterial({ color: 0xff3b30, transparent: true, opacity: 0.6 })
         );
-        this.scene.add(xAxis);
+        this.scene.add(this.xAxis);
 
         const zAxisGeom = new THREE.BufferGeometry().setFromPoints([
             new THREE.Vector3(0, 0, -50), new THREE.Vector3(0, 0, 50)
         ]);
-        const zAxis = new THREE.Line(
+        this.zAxis = new THREE.Line(
             zAxisGeom,
             new THREE.LineBasicMaterial({ color: 0x4cd964, transparent: true, opacity: 0.6 })
         );
-        this.scene.add(zAxis);
+        this.scene.add(this.zAxis);
 
         // ------------------------------------------------------------------
         // Studio Lighting (3-point)
@@ -192,6 +262,59 @@ export class SceneSetup {
         const backLight = new THREE.DirectionalLight(0xffffff, 0.4);
         backLight.position.set(0, 10, -10);
         this.scene.add(backLight);
+
+        // ── Controls ───────────────────────────────────────────────────
+        this.orbit = new THREE.OrbitControls(this.camera, this.renderer.domElement);
+        this.orbit.enableDamping = true;
+        this.orbit.dampingFactor = 0.05;
+        this.orbit.screenSpacePanning = true;
+
+        this.transform = new THREE.TransformControls(this.camera, this.renderer.domElement);
+        this.scene.add(this.transform);
+    }
+
+    /** 
+     * Verbatim extraction of gizmo creation logic from monolithic script.
+     */
+    createGizmo(gizmoGroup, gizmoRenderer, gizmoCamera, mainCamera, orbit, triggerUpdate) {
+        const THREE = this.THREE;
+        const gizmo = new THREE.Object3D();
+        gizmoGroup.add(gizmo);
+
+        const createAxis = (dir, color, label) => {
+            const axis = new THREE.Group();
+            const lineGeom = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), dir.clone().multiplyScalar(0.8)]);
+            const line = new THREE.Line(lineGeom, new THREE.LineBasicMaterial({ color, linewidth: 2 }));
+            axis.add(line);
+
+            // Cap
+            const capGeom = new THREE.SphereGeometry(0.12, 8, 8);
+            const cap = new THREE.Mesh(capGeom, new THREE.MeshBasicMaterial({ color }));
+            cap.position.copy(dir.clone().multiplyScalar(0.8));
+            axis.add(cap);
+            return axis;
+        };
+
+        const xA = createAxis(new THREE.Vector3(1,0,0), 0xff3b30, "X");
+        const yA = createAxis(new THREE.Vector3(0,1,0), 0x4cd964, "Y");
+        const zA = createAxis(new THREE.Vector3(0,0,1), 0x007aff, "Z");
+        gizmo.add(xA, yA, zA);
+
+        const onDown = (e) => {
+            const rect = gizmoRenderer.domElement.getBoundingClientRect();
+            const m = new THREE.Vector2(((e.clientX - rect.left)/100)*2 - 1, -((e.clientY - rect.top)/100)*2 + 1);
+            const raycaster = new THREE.Raycaster();
+            raycaster.setFromCamera(m, gizmoCamera);
+            const intersects = raycaster.intersectObjects([xA, yA, zA], true);
+            if (intersects.length > 0) {
+                const obj = intersects[0].object;
+                if (obj.parent === xA) orbit.setAzimuthalAngle(Math.PI/2);
+                else if (obj.parent === yA) orbit.setPolarAngle(0);
+                else if (obj.parent === zA) orbit.setAzimuthalAngle(0);
+                triggerUpdate();
+            }
+        };
+        gizmoRenderer.domElement.addEventListener("mousedown", onDown);
     }
 
     // -----------------------------------------------------------------------

@@ -66,8 +66,12 @@ export async function loadThreeJS() {
                 }
 
                 if (patchedRaycast) {
-                    patchedRaycast.isAccelerator = true;
-                    targetTHREE.Mesh.prototype.raycast = patchedRaycast;
+                    const originalRaycast = patchedRaycast;
+                    targetTHREE.Mesh.prototype.raycast = function (raycaster, intersects) {
+                        if (this.visible === false) return;
+                        originalRaycast.call(this, raycaster, intersects);
+                    };
+                    targetTHREE.Mesh.prototype.raycast.isAccelerator = true;
                 }
 
                 // Aggressive Ray Polyfill

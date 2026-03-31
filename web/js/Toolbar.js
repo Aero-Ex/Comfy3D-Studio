@@ -9,53 +9,32 @@
  */
 
 export class Toolbar {
-    /**
-     * @param {object} deps
-     * @param {HTMLElement} deps.canvasArea
-     * @param {object} deps.viewport                - ComfyUI node instance.
-     * @param {SelectionManager} deps.selectionManager
-     * @param {ShadingManager} deps.shadingManager
-     * @param {Outliner} deps.outliner
-     * @param {BrushPanel} deps.brushPanel
-     * @param {CommandHistory} deps.history
-     * @param {Function} deps.toggleSegmentationMode
-     * @param {Function} deps.triggerUpdate
-     */
-    constructor(deps) {
-        this.canvasArea = deps.canvasArea;
-        this.viewport = deps.viewport;
-        this.selMgr = deps.selectionManager;
-        this.shadingMgr = deps.shadingManager;
-        this.outliner = deps.outliner;
-        this.brushPanel = deps.brushPanel;
-        this.history = deps.history;
-        this.toggleSegmentationMode = deps.toggleSegmentationMode;
-        this.triggerUpdate = deps.triggerUpdate;
-
-        this.toolbarBtns = {};
-        this.shadingBtns = {};
-        this.selectionBtns = {};
-
-        this._buildSelectionModeUI();
-        this._buildShadingUI();
-        this._buildMainToolbar();
-
-        // Expose update fns to SelectionManager
-        const self = this;
-        this.selMgr.setUICallbacks({
-            updateOutliner: () => this.outliner?.update(),
-            updateOutlinerSelection: () => this.outliner?.updateSelection(),
-            updateSelectionUI: () => this.updateSelectionUI(),
-            updateToolbar: () => this.updateToolbar()
-        });
-
-        // Give Outliner access to updateToolbar
-        if (this.outliner) this.outliner.setUpdateToolbarCallback(() => this.updateToolbar());
-    }
 
     // -----------------------------------------------------------------------
     // Selection Mode UI (top-left)
     // -----------------------------------------------------------------------
+    constructor(THREE, deps) {
+        this.THREE = THREE;
+        Object.assign(this, deps);
+        this.canvasArea = deps.container; // Standardize container as canvasArea for UI panels
+        this.shadingMgr = deps.shadingManager;
+        this.assetLoader = deps.assetLoader;
+        this.history = deps.history;
+        this.selMgr = deps.selectionManager;
+        this.outliner = deps.outliner;
+        this.brushPanel = deps.brushPanel;
+        this.triggerUpdate = deps.triggerUpdate;
+        this.toggleSegmentationMode = deps.toggleSegmentationMode;
+
+        this.selectionBtns = {};
+        this.shadingBtns = {};
+        this.toolbarBtns = {};
+
+        this._buildSelectionModeUI();
+        this._buildShadingUI();
+        this._buildMainToolbar();
+    }
+
     _buildSelectionModeUI() {
         const modePanel = document.createElement("div");
         modePanel.className = "comfy3d-selection-mode-panel";
@@ -185,16 +164,16 @@ export class Toolbar {
         this.canvasArea.appendChild(this.mainToolbar);
 
         const toolButtons = [
-            { id: "select",    icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/></svg>`, title: "Select" },
-            { id: "translate", icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l-7 7 7 7M19 12l-7-7M19 12l-7 7"/></svg>`, title: "Move (G)" },
-            { id: "rotate",    icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-9-9c2.52 0 4.85.83 6.72 2.25L21 3v5h-5"/></svg>`, title: "Rotate (R)" },
-            { id: "scale",     icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 17l10-10M17 17V7M7 7h10"/></svg>`, title: "Scale (S)" },
-            { id: "brush",     icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 11V6a2 2 0 00-2-2v0a2 2 0 00-2 2v0"/><path d="M14 10V8a2 2 0 00-2-2v0a2 2 0 00-2 2v0"/><path d="M10 10.5V6a2 2 0 00-2-2v0a2 2 0 00-2 2v0"/><path d="M18 8a2 2 0 114 0v6a8 8 0 01-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 012.83-2.82L7 15"/></svg>`, title: "Brush (B)" },
-            { id: "point",     icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3" fill="currentColor"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>`, title: "Point Selection (P)" },
-            { id: "split",     icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 21L3 13.5l8-7.5M13 3l8 7.5L13 18"/><line x1="12" y1="2" x2="12" y2="22"/></svg>`, title: "Separate Mesh (V)" },
+            { id: "select",    icon: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/></svg>`, title: "Select" },
+            { id: "translate", icon: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l-7 7 7 7M19 12l-7-7M19 12l-7 7"/></svg>`, title: "Move (G)" },
+            { id: "rotate",    icon: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-9-9c2.52 0 4.85.83 6.72 2.25L21 3v5h-5M3 12a9 9 0 009 9"/></svg>`, title: "Rotate (R)" },
+            { id: "scale",     icon: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M7 17l10-10M17 17V7M7 7h10"/></svg>`, title: "Scale (S)" },
+            { id: "brush",     icon: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 11V6a2 2 0 00-2-2v0a2 2 0 00-2 2v0"/><path d="M14 10V8a2 2 0 00-2-2v0a2 2 0 00-2 2v0"/><path d="M10 10.5V6a2 2 0 00-2-2v0a2 2 0 00-2 2v0"/><path d="M18 8a2 2 0 114 0v6a8 8 0 01-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 012.83-2.82L7 15"/></svg>`, title: "Brush (B)" },
+            { id: "point",     icon: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3" fill="currentColor"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>`, title: "Point Selection (P)" },
+            { id: "split",     icon: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M11 21L3 13.5l8-7.5M13 3l8 7.5L13 18"/><line x1="12" y1="2" x2="12" y2="22"/></svg>`, title: "Separate Mesh (V)" },
             { id: "divider", isDivider: true },
-            { id: "undo",      icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 14L4 9l5-5"/><path d="M20 20v-7a4 4 0 00-4-4H4"/></svg>`, title: "Undo (Alt+Z)" },
-            { id: "redo",      icon: `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 14l5-5-5-5"/><path d="M4 20v-7a4 4 0 014-4h12"/></svg>`, title: "Redo (Alt+Y)" }
+            { id: "undo",      icon: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14L4 9l5-5"/><path d="M20 20v-7a4 4 0 00-4-4H4"/></svg>`, title: "Undo (Alt+Z)" },
+            { id: "redo",      icon: `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 14l5-5-5-5"/><path d="M4 20v-7a4 4 0 014-4h12"/></svg>`, title: "Redo (Alt+Y)" }
         ];
 
         toolButtons.forEach(tool => {

@@ -46,19 +46,23 @@ class Comfy3DStudioNode:
                     # Relativize absolute paths for ComfyUI API compatibility
                     folder_type = "output" # Default
                     if os.path.isabs(input_3d):
-                        out_dir = folder_paths.get_output_directory()
-                        tmp_dir = folder_paths.get_temp_directory()
-                        in_dir = folder_paths.get_input_directory()
-                        
-                        if input_3d.startswith(out_dir):
-                            input_3d = os.path.relpath(input_3d, out_dir)
+                        out_dir = os.path.abspath(folder_paths.get_output_directory()).rstrip(os.path.sep)
+                        tmp_dir = os.path.abspath(folder_paths.get_temp_directory()).rstrip(os.path.sep)
+                        in_dir = os.path.abspath(folder_paths.get_input_directory()).rstrip(os.path.sep)
+                        abs_input = os.path.abspath(input_3d)
+
+                        if abs_input.startswith(out_dir):
+                            input_3d = os.path.relpath(abs_input, out_dir)
                             folder_type = "output"
-                        elif input_3d.startswith(tmp_dir):
-                            input_3d = os.path.relpath(input_3d, tmp_dir)
+                        elif abs_input.startswith(tmp_dir):
+                            input_3d = os.path.relpath(abs_input, tmp_dir)
                             folder_type = "temp"
-                        elif input_3d.startswith(in_dir):
-                            input_3d = os.path.relpath(input_3d, in_dir)
+                        elif abs_input.startswith(in_dir):
+                            input_3d = os.path.relpath(abs_input, in_dir)
                             folder_type = "input"
+                        else:
+                            # Not in a standard root, keep as-is but hope for the best
+                            input_3d = abs_input
                     else:
                         # If path is already relative, try to guess where it is
                         out_dir = folder_paths.get_output_directory()
@@ -151,10 +155,7 @@ def trimesh_texture_split(mesh_path, quantization_steps=16.0):
         print("[Comfy3D] Mesh has no UVs, cannot split by texture. Skipping.")
         return mesh_path
 
-    img_np = np.array(pil_img.convert('RGB')) / 255.0  
-    # CRITICAL: Convert sRGB texture colors to Linear space for PBR baseColorFactor
-    # This prevents the "washed out" / "lighter" look (color drift)
-    img_np = np.power(img_np, 2.2)
+    img_np = np.array(pil_img.convert('RGB')) / 255.0 
     
     h, w = img_np.shape[:2]
     
@@ -178,30 +179,99 @@ def trimesh_texture_split(mesh_path, quantization_steps=16.0):
     
     face_colors = img_np[pixel_y, pixel_x] 
     
-    # Increase precision for internal grouping to avoid hue snap
-    # We round to grouping_steps, then use the MEAN color of the group for output
-    crushed_colors = np.round(face_colors * quantization_steps) / quantization_steps
+    # --- Convert to HSV for meaningfull semantic color splitting ---
+    r, g, b = face_colors[:, 0], face_colors[:, 1], face_colors[:, 2]
+    maxc = np.maximum(np.maximum(r, g), b)
+    minc = np.minimum(np.minimum(r, g), b)
+    val = maxc
+    deltac = maxc - minc
+    
+    sat = np.zeros_like(maxc)
+    hue = np.zeros_like(maxc)
+    
+    idx = (maxc != 0)
+    sat[idx] = deltac[idx] / maxc[idx]
+    
+    idx_d = (deltac != 0)
+    
+    idx_r = idx_d & (maxc == r)
+    hue[idx_r] = (g[idx_r] - b[idx_r]) / deltac[idx_r]
+    
+    idx_g = idx_d & (maxc == g) & ~idx_r
+    hue[idx_g] = (b[idx_g] - r[idx_g]) / deltac[idx_g] + 2.0
+    
+    idx_b = idx_d & (maxc == b) & ~idx_r & ~idx_g
+    hue[idx_b] = (r[idx_b] - g[idx_b]) / deltac[idx_b] + 4.0
+    
+    hue = (hue / 6.0) % 1.0 
+    
+    # Pure grays are hue-agnostic, force to 0 so they don't fragment
+    hue[sat < 0.15] = 0.0
+    
+    # Increase precision for hue vs brightness to snap to correct semantics
+    # To prevent over-segmentation (e.g. wall splitting into 10 shading stripes), 
+    # we prioritize Hue and heavily suppress S/V variance.
+    h_steps = max(6.0, quantization_steps * 1.5)
+    sv_steps = max(2.0, quantization_steps / 2.5)
+    
+    hq = np.round(hue * h_steps) / h_steps
+    hq[hq == 1.0] = 0.0 # Red hue wraps natively
+    sq = np.round(sat * sv_steps) / sv_steps
+    vq = np.round(val * sv_steps) / sv_steps
+    
+    crushed_colors = np.column_stack((hq, sq, vq))
     unique_colors, face_color_indices = np.unique(crushed_colors, axis=0, return_inverse=True)
     
+    try:
+        import collections
+        adjacency = mesh.face_adjacency
+        
+        # Build quick adjacency dict
+        adj_dict = {}
+        for f1, f2 in adjacency:
+            if f1 not in adj_dict:
+                adj_dict[f1] = []
+            if f2 not in adj_dict:
+                adj_dict[f2] = []
+            adj_dict[f1].append(int(f2))
+            adj_dict[f2].append(int(f1))
+            
+        # Run 2 iterations of majority voting
+        for _ in range(2):
+            new_indices = face_color_indices.copy()
+            for face_idx in range(len(face_color_indices)):
+                neighbors = adj_dict.get(face_idx, [])
+                if len(neighbors) < 2:
+                    continue
+                neighbor_labels = [face_color_indices[n] for n in neighbors]
+                count = collections.Counter(neighbor_labels)
+                most_common, freq = count.most_common(1)[0]
+                
+                # If 2 or more neighbors share a different label, adopt their label
+                if most_common != face_color_indices[face_idx] and freq >= 2:
+                    new_indices[face_idx] = most_common
+            face_color_indices = new_indices
+            
+    except Exception as e:
+        print(f"[Comfy3D] Failed to smooth texture labels: {e}")
+        
     scene_out = trimesh.Scene()
     part_idx = 0
     
     for i, _ in enumerate(unique_colors):
         mask = (face_color_indices == i)
-        # Use the actual average color of the faces in this segment for best accuracy
-        color = face_colors[mask].mean(axis=0)
         
         sub_mesh = mesh.submesh([mask], append=True)
-        r, g, b = np.clip(color * 255, 0, 255).astype(np.uint8)
         
-        # Assign color-based material
-        p_mat = material.PBRMaterial(
-            baseColorFactor=[r, g, b, 255], 
-            metallicFactor=0.0, 
-            roughnessFactor=1.0,
-            doubleSided=True  # Ensure both sides are visible in viewport
-        )
-        sub_mesh.visual = TextureVisuals(material=p_mat)
+        try:
+            sub_mesh.remove_unreferenced_vertices()
+        except:
+            pass
+        
+        # Keep the original material and UV mapping instead of replacing it with a flat color
+        if hasattr(sub_mesh, 'visual') and hasattr(sub_mesh.visual, 'material'):
+            sub_mesh.visual.material = mat
+            
         scene_out.add_geometry(sub_mesh, geom_name=f"part_{part_idx}")
         part_idx += 1
 
@@ -209,6 +279,128 @@ def trimesh_texture_split(mesh_path, quantization_steps=16.0):
     out_path = os.path.join(folder_paths.get_temp_directory(), out_filename)
     scene_out.export(out_path)
     return out_path
+
+def resolve_mesh_path(filename):
+    import os
+    import glob
+    import folder_paths
+    
+    path = filename
+    if os.path.exists(path):
+        return path
+        
+    candidates = [
+        os.path.join(folder_paths.get_output_directory(), filename),
+        os.path.join(folder_paths.get_temp_directory(), filename),
+        os.path.join(folder_paths.get_input_directory(), filename)
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+            
+    if not os.path.exists(path):
+        import glob
+        print(f"[Comfy3D] Exact path not found for {filename}, performing deep search...")
+        search_dirs = [folder_paths.get_output_directory(), folder_paths.get_temp_directory(), folder_paths.get_input_directory()]
+        for d in search_dirs:
+            if not d: continue
+            # Search recursively for the filename
+            search_pattern = os.path.join(d, "**", os.path.basename(filename))
+            matches = glob.glob(search_pattern, recursive=True)
+            if matches:
+                path = matches[0]
+                print(f"[Comfy3D] Deep search found: {path}")
+                return path
+            
+    return path
+
+async def split_selection_api(request):
+    try:
+        import trimesh
+        import numpy as np
+        data = await request.json()
+        filename = data.get("filename")
+        face_indices = data.get("face_indices") # List[int]
+        vertex_indices = data.get("vertex_indices") # List[int]
+        
+        if not filename:
+            return web.json_response({"error": "No filename provided"}, status=400)
+            
+        # Resolve path
+        path = resolve_mesh_path(filename)
+        
+        if not os.path.exists(path):
+            return web.json_response({"error": f"File not found: {path}"}, status=404)
+            
+        # Load mesh
+        scene = trimesh.load(path, force='scene')
+        geom_names = list(scene.geometry.keys())
+        if not geom_names:
+            return web.json_response({"error": "No geometry in file"}, status=400)
+        
+        # We only support splitting the first geometry in the file for now
+        g_name = geom_names[0]
+        mesh = scene.geometry[g_name]
+        
+        # 1. Determine mask
+        mask = np.zeros(len(mesh.faces), dtype=bool)
+        if face_indices:
+            mask[face_indices] = True
+        elif vertex_indices:
+            # Faces that contain ANY of these vertices
+            v_set = set(vertex_indices)
+            for i, face in enumerate(mesh.faces):
+                if any(v in v_set for v in face):
+                    mask[i] = True
+        
+        if not mask.any():
+            return web.json_response({"error": "No faces selected for split"}, status=400)
+            
+        # 2. Extract split mesh
+        split_mesh = mesh.submesh([mask], append=True)
+        
+        # 3. Create original-minus-selection mesh
+        original_reduced = mesh.submesh([~mask], append=True)
+        
+        # Force opaque materials so Three.js doesn't render them invisible
+        for m_name, m in [("split", split_mesh), ("reduced", original_reduced)]:
+            # Strip unreferenced vertices so the bounding box/pivot correctly shrinks to the new isolated piece!
+            try:
+                m.remove_unreferenced_vertices()
+            except Exception as e:
+                print(f"[Comfy3D] Failed to remove unreferenced vertices for {m_name}: {e}")
+
+            if hasattr(m, 'visual'):
+                if hasattr(m.visual, 'material') and hasattr(m.visual.material, 'baseColorFactor'):
+                    orig_color = m.visual.material.baseColorFactor
+                    print(f"[Comfy3D] {m_name} original color: {orig_color}")
+                    if m.visual.material.baseColorFactor is None:
+                        m.visual.material.baseColorFactor = [200, 200, 200, 255]
+                        print(f"[Comfy3D] -> Fixed: None -> [200, 200, 200, 255]")
+                    elif len(m.visual.material.baseColorFactor) == 4:
+                        if m.visual.material.baseColorFactor[3] < 255:
+                            m.visual.material.baseColorFactor[3] = 255
+                            print(f"[Comfy3D] -> Fixed: {orig_color} -> {m.visual.material.baseColorFactor}")
+                elif hasattr(m.visual, 'vertex_colors') and m.visual.vertex_colors is not None and len(m.visual.vertex_colors) > 0:
+                    print(f"[Comfy3D] {m_name} fixing vertex colors alpha...")
+                    m.visual.vertex_colors[:, 3] = 255
+
+        # 4. Export both
+        out1_filename = f"studio_reduced_{uuid.uuid4().hex}.glb"
+        out2_filename = f"studio_selection_{uuid.uuid4().hex}.glb"
+        out1_path = os.path.join(folder_paths.get_temp_directory(), out1_filename)
+        out2_path = os.path.join(folder_paths.get_temp_directory(), out2_filename)
+        
+        original_reduced.export(out1_path)
+        split_mesh.export(out2_path)
+        
+        return web.json_response({
+            "reduced": {"filename": out1_filename, "type": "temp"},
+            "selection": {"filename": out2_filename, "type": "temp"}
+        })
+    except Exception as e:
+        print(f"[Comfy3D] Split Selection Error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
 
 async def split_mesh_api(request):
     try:
@@ -221,17 +413,7 @@ async def split_mesh_api(request):
             return web.json_response({"error": "No filename provided"}, status=400)
 
         # Resolve path
-        path = filename
-        if not os.path.isabs(path):
-            candidates = [
-                os.path.join(folder_paths.get_output_directory(), filename),
-                os.path.join(folder_paths.get_temp_directory(), filename),
-                os.path.join(folder_paths.get_input_directory(), filename)
-            ]
-            for c in candidates:
-                if c and os.path.exists(c):
-                    path = c
-                    break
+        path = resolve_mesh_path(filename)
 
         if not os.path.exists(path):
             return web.json_response({"error": f"File not found: {path}"}, status=404)
@@ -269,17 +451,7 @@ async def join_mesh_api(request):
             target_meshes = entry.get("meshes") # Optional list of names
             
             # Resolve path
-            path = filename
-            if not os.path.isabs(path):
-                candidates = [
-                    os.path.join(folder_paths.get_output_directory(), filename),
-                    os.path.join(folder_paths.get_temp_directory(), filename),
-                    os.path.join(folder_paths.get_input_directory(), filename)
-                ]
-                for c in candidates:
-                    if c and os.path.exists(c):
-                        path = c
-                        break
+            path = resolve_mesh_path(filename)
             
             if os.path.exists(path):
                 # Load current mesh
@@ -323,6 +495,16 @@ async def join_mesh_api(request):
 
         merged_mesh = trimesh.util.concatenate(proc_geoms)
         
+        # Force opaque materials so Three.js doesn't render it invisible
+        if hasattr(merged_mesh, 'visual'):
+            if hasattr(merged_mesh.visual, 'material') and hasattr(merged_mesh.visual.material, 'baseColorFactor'):
+                if merged_mesh.visual.material.baseColorFactor is None:
+                    merged_mesh.visual.material.baseColorFactor = [200, 200, 200, 255]
+                elif len(merged_mesh.visual.material.baseColorFactor) == 4:
+                    merged_mesh.visual.material.baseColorFactor[3] = 255
+            elif hasattr(merged_mesh.visual, 'vertex_colors') and merged_mesh.visual.vertex_colors is not None and len(merged_mesh.visual.vertex_colors) > 0:
+                merged_mesh.visual.vertex_colors[:, 3] = 255
+
         out_filename = f"studio_merged_{uuid.uuid4().hex}.glb"
         out_path = os.path.join(folder_paths.get_temp_directory(), out_filename)
         merged_mesh.export(out_path)
@@ -347,9 +529,11 @@ def setup_api():
             router = PromptServer.instance.app.router
             if hasattr(router, "add_post"):
                 router.add_post("/comfy3d/split_mesh", split_mesh_api)
+                router.add_post("/comfy3d/split_selection", split_selection_api)
                 router.add_post("/comfy3d/join_mesh", join_mesh_api)
             else:
                 router.add_route("POST", "/comfy3d/split_mesh", split_mesh_api)
+                router.add_route("POST", "/comfy3d/split_selection", split_selection_api)
                 router.add_route("POST", "/comfy3d/join_mesh", join_mesh_api)
             print("[Comfy3D] API route registered successfully.")
     except Exception as e:

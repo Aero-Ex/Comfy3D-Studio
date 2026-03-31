@@ -9,37 +9,11 @@
 export class TransformManager {
     /**
      * @param {object} THREE
-     * @param {THREE.Scene} scene
-     * @param {THREE.Camera} camera
-     * @param {THREE.WebGLRenderer} renderer
-     * @param {THREE.OrbitControls} orbit
-     * @param {THREE.Group} gizmoGroup - Orientation gizmo group from SceneSetup.
-     * @param {THREE.WebGLRenderer} gizmoRenderer
-     * @param {THREE.Scene} gizmoScene
-     * @param {THREE.Camera} gizmoCamera
-     * @param {SelectionManager} selectionManager
-     * @param {object} viewport - ComfyUI node instance.
-     * @param {CommandHistory} history
-     * @param {Function} triggerUpdate
-     * @param {Function} updateHUD
+     * @param {object} deps
      */
-    constructor(THREE, scene, camera, renderer, orbit,
-        gizmoGroup, gizmoRenderer, gizmoScene, gizmoCamera,
-        selectionManager, viewport, history, triggerUpdate, updateHUD) {
+    constructor(THREE, deps) {
         this.THREE = THREE;
-        this.scene = scene;
-        this.camera = camera;
-        this.renderer = renderer;
-        this.orbit = orbit;
-        this.gizmoGroup = gizmoGroup;
-        this.gizmoRenderer = gizmoRenderer;
-        this.gizmoScene = gizmoScene;
-        this.gizmoCamera = gizmoCamera;
-        this.selMgr = selectionManager;
-        this.viewport = viewport;
-        this.history = history;
-        this.triggerUpdate = triggerUpdate;
-        this.updateHUD = updateHUD;
+        Object.assign(this, deps);
 
         this._buildTransformControls();
         this._buildAxisGizmo();
@@ -48,9 +22,6 @@ export class TransformManager {
         this._bindTransformGizmoEvents();
     }
 
-    // -----------------------------------------------------------------------
-    // TransformControls
-    // -----------------------------------------------------------------------
     _buildTransformControls() {
         const THREE = this.THREE;
         this.transformControls = new THREE.TransformControls(this.camera, this.renderer.domElement);
@@ -192,10 +163,11 @@ export class TransformManager {
 
         this.transformControls.addEventListener("change", () => {
             const { selectedObjects, selectionProxy } = this.selMgr;
-            if (this.transformControls.dragging && selectedObjects.length > 0) {
+            const visibleSelected = selectedObjects.filter(o => o && o.visible !== false);
+            if (this.transformControls.dragging && visibleSelected.length > 0) {
                 selectionProxy.updateMatrixWorld(true);
                 const deltaMatrix = selectionProxy.matrixWorld.clone().multiply(initialProxyMatrixInverse);
-                selectedObjects.forEach(obj => {
+                visibleSelected.forEach(obj => {
                     const initial = initialStates.get(obj);
                     if (initial) {
                         const newWorldMatrix = deltaMatrix.clone().multiply(initial.matrix);
@@ -309,10 +281,13 @@ export class TransformManager {
         }
 
         if (!mt.isSubMesh) {
+            const visibleSelected = selectedObjects.filter(o => o && o.visible !== false);
+            if (visibleSelected.length === 0) { mt.active = false; this.orbit.enabled = true; return; }
+            
             const box = new THREE.Box3();
-            selectedObjects.forEach(obj => { obj.updateMatrixWorld(true); box.expandByObject(obj); });
+            visibleSelected.forEach(obj => { obj.updateMatrixWorld(true); box.expandByObject(obj); });
             mt.center = box.getCenter(new THREE.Vector3());
-            selectedObjects.forEach(obj => {
+            visibleSelected.forEach(obj => {
                 mt.startStates.push({
                     object: obj, position: obj.position.clone(),
                     quaternion: obj.quaternion.clone(), scale: obj.scale.clone(),

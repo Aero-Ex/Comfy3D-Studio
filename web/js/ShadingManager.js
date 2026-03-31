@@ -9,13 +9,11 @@
 export class ShadingManager {
     /**
      * @param {object} THREE
-     * @param {object[]} assets - Live array of root scene objects.
-     * @param {Function} triggerUpdate - Requests a render frame.
+     * @param {object} deps
      */
-    constructor(THREE, assets, triggerUpdate) {
+    constructor(THREE, deps) {
         this.THREE = THREE;
-        this.assets = assets;
-        this.triggerUpdate = triggerUpdate;
+        Object.assign(this, deps);
 
         this.currentShadingMode = "material";
         this.xrayMode = false;
@@ -27,7 +25,6 @@ export class ShadingManager {
         this.normalMaterial = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
     }
 
-    // -----------------------------------------------------------------------
     // chunkMesh — splits a massive mesh into draw-range sub-chunks
     //
     // -----------------------------------------------------------------------

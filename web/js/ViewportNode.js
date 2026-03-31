@@ -8,7 +8,7 @@
  */
 
 import { loadThreeJS } from "./ThreeLoader.js";
-import { CommandHistory } from "./CommandHistory.js";
+import { CommandHistory, MultiTransformCommand, SubMeshTransformCommand } from "./CommandHistory.js";
 import { SceneSetup } from "./SceneSetup.js";
 import { ShadingManager } from "./ShadingManager.js";
 import { SelectionManager } from "./SelectionManager.js";
@@ -107,7 +107,7 @@ function makeCommandClasses({ assets, scene, selMgr, getIsolatedObjects }) {
         redo() { this._apply(this.new); }
     }
 
-    return { AssetCommand, RenameCommand, MultiAssetCommand, SeparateMeshCommand, SubMeshSelectionCommand };
+    return { AssetCommand, RenameCommand, MultiAssetCommand, SeparateMeshCommand, SubMeshSelectionCommand, MultiTransformCommand };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -147,17 +147,38 @@ export async function registerViewportNode(app, THREE) {
                 const assets = [];
                 const history = new CommandHistory();
 
+                // ── DOM Layout ────────────────────────────────────────────────
+                const container = document.createElement("div");
+                container.className = "comfy3d-studio-viewport";
+                Object.assign(container.style, {
+                    flex: "1", width: "100%", height: "100%",
+                    maxHeight: "calc(100% - 10px)", background: "#0a0a0a",
+                    position: "relative", display: "flex", flexDirection: "column",
+                    overflow: "hidden", pointerEvents: "auto", zIndex: 1000
+                });
+
+                const domWidget = this.addDOMWidget("threejs_studio", "viewport", container);
+                domWidget.y = 0;
+                this.size = [1200, 720];
+                domWidget.computeSize = (width) => [width, Math.max(300, Math.floor(this.size[1] - 80))];
+
+                const canvasArea = document.createElement("div");
+                Object.assign(canvasArea.style, {
+                    flex: "1", position: "relative", pointerEvents: "auto",
+                    margin: "0", padding: "0", overflow: "hidden"
+                });
+                container.appendChild(canvasArea);
+
                 // ── Scene Setup ───────────────────────────────────────────────
-                const sceneSetup = new SceneSetup(THREE, this);
+                const sceneSetup = new SceneSetup(THREE, canvasArea);
                 const {
-                    container, canvasArea, renderer, gizmoRenderer,
-                    camera, scene, selectionProxy, pointsGroup,
-                    xAxis, gizmoScene, gizmoCamera, gizmoGroup,
-                    selectionRect, brushCursor
+                    renderer, gizmoRenderer, camera, scene, selectionProxy, pointsGroup,
+                    xAxis, gizmoScene, gizmoCamera, gizmoGroup, selectionRect, brushCursor,
+                    selectionHelper, vertexHighlight, edgeHighlight, persistentVertexPoints,
+                    persistentWireframe, faceHighlight
                 } = sceneSetup;
 
                 viewport.transform = sceneSetup.transform;
-                scene.add(xAxis);
 
                 // ── Shared helpers ─────────────────────────────────────────────
                 let needsUpdate = false;
@@ -266,74 +287,6 @@ export async function registerViewportNode(app, THREE) {
                     hud.textContent = msg;
                 };
 
-                // ── Shading Manager ───────────────────────────────────────────
-                const shadingManager = new ShadingManager(THREE, scene, viewport, triggerUpdate);
-
-                // ── Selection Manager ─────────────────────────────────────────
-                const selectionManager = new SelectionManager(THREE, {
-                    scene, camera, renderer, assets, viewport,
-                    selectionProxy, transform: viewport.transform,
-                    triggerUpdate
-                });
-                selectionManager._viewport = viewport; // for SubMeshSelectionCommand
-
-                // ── Command classes ────────────────────────────────────────────
-                const commandClasses = makeCommandClasses({ assets, scene, selMgr: selectionManager, getIsolatedObjects });
-                history._commandClasses = commandClasses;
-
-                // ── Transform Manager ─────────────────────────────────────────
-                const transformManager = new TransformManager(THREE, {
-                    viewport, scene, camera, renderer, assets,
-                    selectionManager, history, commandClasses, triggerUpdate, updateHUD
-                });
-
-                // ── Outliner ──────────────────────────────────────────────────
-                const outliner = new Outliner({
-                    canvasArea, assets, scene, selectionManager, history,
-                    commandClasses: { AssetCommand: commandClasses.AssetCommand, RenameCommand: commandClasses.RenameCommand },
-                    triggerUpdate
-                });
-                selectionManager.setUICallbacks?.({
-                    updateOutliner: () => outliner.update(),
-                    updateOutlinerSelection: () => outliner.updateSelection(),
-                    updateSelectionUI: () => toolbar?.updateSelectionUI(),
-                    updateToolbar: () => toolbar?.updateToolbar()
-                });
-                // expose for command classes
-                selectionManager.updateOutliner = () => outliner.update();
-
-                // ── Brush Panel ───────────────────────────────────────────────
-                const brushPanel = new BrushPanel(canvasArea, viewport);
-
-                // ── Segmentation Panel ────────────────────────────────────────
-                const segPanel = new SegmentationPanel({
-                    canvasArea, viewport, assets, scene, selectionManager, history,
-                    commandClasses: { SeparateMeshCommand: commandClasses.SeparateMeshCommand },
-                    assetLoader: null, // set below after AssetLoader is created
-                    shadingManager, toggleLoading, frameScene, toggleIsolate,
-                    getIsolatedObjects,
-                    triggerUpdate, updateOutliner: () => outliner.update()
-                });
-
-                // ── Toolbar ───────────────────────────────────────────────────
-                const toolbar = new Toolbar({
-                    canvasArea, viewport, selectionManager, shadingManager,
-                    outliner, brushPanel, history,
-                    toggleSegmentationMode: () => segPanel.toggle(),
-                    triggerUpdate
-                });
-                segPanel.setUpdateToolbarCallback(() => toolbar.updateToolbar());
-                segPanel.setToolbar(toolbar);
-
-                // ── Asset Loader ──────────────────────────────────────────────
-                const assetLoader = new AssetLoader(THREE, {
-                    assets, scene, selectionManager, shadingManager, history,
-                    commandClasses: { AssetCommand: commandClasses.AssetCommand },
-                    container, toggleLoading, frameScene, triggerUpdate
-                });
-                segPanel.assetLoader = assetLoader;
-
-                // ── Point‐selection VXZ helpers ───────────────────────────────
                 const addVXZPoint = (intersect) => {
                     const obj = intersect.object;
                     const worldPoint = intersect.point.clone();
@@ -439,22 +392,88 @@ export async function registerViewportNode(app, THREE) {
                     sceneSetup.orbit.enabled = !e.value;
                 });
 
-                // ── Gizmo setup ───────────────────────────────────────────────
-                sceneSetup.createGizmo(gizmoGroup, gizmoRenderer, gizmoCamera, camera, sceneSetup.orbit, triggerUpdate);
+                // ── Shared Deps (passed to every manager) ────────────────────
+                const sharedDeps = {
+                    THREE, scene, camera, renderer, viewport, assets, history,
+                    orbit: sceneSetup.orbit,
+                    container: canvasArea,
+                    // SceneSetup objects
+                    selectionProxy: sceneSetup.selectionProxy,
+                    selectionHelper: sceneSetup.selectionHelper,
+                    vertexHighlight: sceneSetup.vertexHighlight,
+                    edgeHighlight: sceneSetup.edgeHighlight,
+                    faceHighlight: sceneSetup.faceHighlight,
+                    persistentVertexPoints: sceneSetup.persistentVertexPoints,
+                    persistentWireframe: sceneSetup.persistentWireframe,
+                    gizmoGroup: sceneSetup.gizmoGroup,
+                    gizmoRenderer: sceneSetup.gizmoRenderer,
+                    gizmoCamera: sceneSetup.gizmoCamera,
+                    gizmoScene: sceneSetup.gizmoScene,
+                    loadingOverlay: sceneSetup.loadingOverlay,
+                    // Shared helpers
+                    triggerUpdate, updateHUD, frameScene, toggleIsolate, getIsolatedObjects,
+                    toggleLoading, pointsGroup, selectionRect, brushCursor,
+                    updateSelectionPointsUI: null, addVXZPoint, removeVXZPoint,
+                    selectionManager: null, // to be patched
+                    selMgr: null,           // to be patched
+                    commandClasses: null    // to be patched
+                };
+                // Circular: updateSelectionPointsUI is defined above sharedDeps, patch it in
+                sharedDeps.updateSelectionPointsUI = updateSelectionPointsUI;
 
-                // ── Input Handler ─────────────────────────────────────────────
-                const inputHandler = new InputHandler(THREE, {
-                    renderer, camera, orbit: sceneSetup.orbit, scene, assets, viewport,
-                    selectionManager, transformManager, history, commandClasses,
-                    pointsGroup, container, selectionRect, brushCursor,
-                    frameScene, toggleIsolate, getIsolatedObjects,
-                    updateSelectionPointsUI, addVXZPoint, removeVXZPoint,
-                    toggleSegmentationMode: () => segPanel.toggle(),
-                    toolbar, triggerUpdate, updateHUD
+                // ── Manager Instantiation ────────────────────────────────────
+                const selectionManager = new SelectionManager(THREE, sharedDeps);
+                const commandClasses = makeCommandClasses({ assets, scene, selMgr: selectionManager, getIsolatedObjects });
+                
+                sharedDeps.selectionManager = selectionManager;
+                sharedDeps.selMgr = selectionManager;
+                sharedDeps.commandClasses = commandClasses;
+
+                const transformManager = new TransformManager(THREE, sharedDeps);
+                selectionManager.setTransformManager(transformManager);
+                sharedDeps.transformManager = transformManager;
+
+                const shadingManager = new ShadingManager(THREE, sharedDeps);
+                sharedDeps.shadingManager = shadingManager;
+                sharedDeps.shadingMgr = shadingManager;
+
+                const assetLoader = new AssetLoader(THREE, sharedDeps);
+                sharedDeps.assetLoader = assetLoader;
+
+                const outliner = new Outliner(THREE, sharedDeps);
+                const updateOutliner = () => outliner.update();
+                sharedDeps.updateOutliner = updateOutliner;
+                selectionManager._expandedObjects = outliner.expandedObjects;
+
+                const brushPanel = new BrushPanel(THREE, sharedDeps);
+                const segPanel = new SegmentationPanel(THREE, sharedDeps);
+
+                const toolbar = new Toolbar(THREE, {
+                    ...sharedDeps, outliner, brushPanel,
+                    toggleSegmentationMode: () => segPanel.toggle()
                 });
-                inputHandler.setShadingManager(shadingManager);
-                inputHandler.setUpdateOutlinerCallback(() => outliner.update());
-                inputHandler.setSegmentationPanel(segPanel);
+
+                // ── Wire cross-module callbacks ───────────────────────────────
+                selectionManager.setUICallbacks({
+                    updateOutliner: updateOutliner,
+                    updateOutlinerSelection: () => outliner.updateSelection?.(),
+                    updateSelectionUI: () => toolbar.updateSelectionUI?.(),
+                    updateToolbar: () => toolbar.updateToolbar()
+                });
+                selectionManager.updateOutliner = updateOutliner;
+
+                // ── Wire TransformManager command classes ─────────────────────
+                transformManager.setCommandClasses(commandClasses.MultiTransformCommand);
+                transformManager.setSubMeshTransformCommand(SubMeshTransformCommand);
+
+                const inputHandler = new InputHandler(THREE, {
+                    ...sharedDeps, selectionManager, transformManager, shadingManager,
+                    toolbar, outliner, segPanel,
+                    toggleSegmentationMode: () => segPanel.toggle()
+                });
+                inputHandler.setShadingManager?.(shadingManager);
+                inputHandler.setUpdateOutlinerCallback?.(() => outliner.update());
+                inputHandler.setSegmentationPanel?.(segPanel);
 
                 // ── Resize Observer ───────────────────────────────────────────
                 let lastW = 0, lastH = 0;
@@ -493,6 +512,7 @@ export async function registerViewportNode(app, THREE) {
                 toolbar.updateToolbar();
                 outliner.update();
                 selectionManager.updateSelectionHelper?.();
+                triggerUpdate();
 
                 // ── Cleanup ────────────────────────────────────────────────────
                 viewport.onRemoved = () => {

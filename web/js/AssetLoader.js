@@ -11,33 +11,41 @@ export class AssetLoader {
     /**
      * @param {object} THREE
      * @param {object} deps
-     * @param {object[]} deps.assets         - Shared live asset array.
-     * @param {THREE.Scene} deps.scene
-     * @param {SelectionManager} deps.selectionManager
-     * @param {ShadingManager} deps.shadingManager
-     * @param {CommandHistory} deps.history
-     * @param {object} deps.commandClasses   - { AssetCommand }
-     * @param {HTMLElement} deps.container   - Root container for drag-drop.
-     * @param {Function} deps.toggleLoading
-     * @param {Function} deps.frameScene
-     * @param {Function} deps.triggerUpdate
      */
-    constructor(THREE, { assets, scene, selectionManager, shadingManager, history, commandClasses, container, toggleLoading, frameScene, triggerUpdate }) {
+    constructor(THREE, deps) {
         this.THREE = THREE;
-        this.assets = assets;
-        this.scene = scene;
-        this.selMgr = selectionManager;
-        this.shadingMgr = shadingManager;
-        this.history = history;
-        this.AssetCommand = commandClasses.AssetCommand;
-        this.container = container;
-        this.toggleLoading = toggleLoading;
-        this.frameScene = frameScene;
-        this.triggerUpdate = triggerUpdate;
+        Object.assign(this, deps);
+
+        if (deps.commandClasses) {
+            this.AssetCommand = deps.commandClasses.AssetCommand;
+        }
 
         this._bindDragDrop();
     }
 
+    // -----------------------------------------------------------------------
+    // _ensureValidMaterials
+    // -----------------------------------------------------------------------
+    _ensureValidMaterials(raw) {
+        const THREE = this.THREE;
+        raw.traverse(c => {
+            if (c.isMesh) {
+                if (c.geometry && !c.geometry.attributes.normal) {
+                    c.geometry.computeVertexNormals();
+                }
+                const hasColors = c.geometry && !!c.geometry.attributes.color;
+                if (!c.material || (Array.isArray(c.material) && c.material.length === 0)) {
+                    c.material = new THREE.MeshPhongMaterial({ color: 0xcccccc, side: THREE.DoubleSide, vertexColors: hasColors });
+                } else {
+                    const mats = Array.isArray(c.material) ? c.material : [c.material];
+                    mats.forEach(m => {
+                        m.side = THREE.DoubleSide;
+                        if (hasColors) m.vertexColors = true;
+                    });
+                }
+            }
+        });
+    }
     // -----------------------------------------------------------------------
     // loadAssetSilent
     // -----------------------------------------------------------------------
@@ -58,11 +66,14 @@ export class AssetLoader {
                     raw = new THREE.Mesh(result, new THREE.MeshStandardMaterial({ color: 0xcccccc }));
                 }
 
+                this._ensureValidMaterials(raw);
+
                 const meshes = [];
                 raw.traverse(c => { if (c.isMesh) meshes.push(c); });
 
                 if (meshes.length === 1) {
                     let model = meshes[0];
+                    if (model.parent) model.removeFromParent();
                     model.name = filename;
                     model.userData.filename = filename;
                     model.userData.type = type;
@@ -89,6 +100,7 @@ export class AssetLoader {
         obj.traverse(m => this.shadingMgr.updateMeshShading(m));
         console.log("Comfy3D: Asset added via Command:", obj.name);
         this.selMgr.selectObject(obj);
+        this.selMgr.updateOutliner?.();
     }
 
     // -----------------------------------------------------------------------
@@ -106,25 +118,32 @@ export class AssetLoader {
             filename = parts.pop();
 
             const roots = ["output", "input", "temp"];
-            let rootIdx = -1;
-            let foundRoot = "";
+            let foundRoot = null;
+            let foundIdx = -1;
 
             for (const root of roots) {
                 const idx = parts.lastIndexOf(root);
-                if (idx > rootIdx) { rootIdx = idx; foundRoot = root; }
+                if (idx > foundIdx) { foundIdx = idx; foundRoot = root; }
             }
 
-            if (rootIdx !== -1) {
-                subfolder = parts.slice(rootIdx + 1).join("/");
+            if (foundRoot) {
                 type = foundRoot;
+                subfolder = parts.slice(foundIdx + 1).join("/");
             } else {
-                subfolder = "";
+                // If it starts with /home or similar, it's an absolute path we failed to relativize
+                if (parts.length > 1 && (parts[0] === "" || parts[1] === "home" || parts[1] === "mnt")) {
+                    subfolder = ""; // Can't serve absolute paths via /view easily
+                } else {
+                    subfolder = parts.join("/");
+                }
             }
         }
 
-        let url = `/api/view?filename=${encodeURIComponent(filename)}`;
-        if (subfolder) url += `&subfolder=${encodeURIComponent(subfolder)}`;
-        url += `&type=${type}`;
+        // ComfyUI /view API format: /view?filename=NAME&subfolder=SUB&type=TYPE
+        let url = `/view?filename=${encodeURIComponent(filename)}&type=${type}`;
+        if (subfolder && subfolder !== "/") {
+            url += `&subfolder=${encodeURIComponent(subfolder)}`;
+        }
 
         let loader;
         if (ext === "glb" || ext === "gltf") loader = new THREE.GLTFLoader();
@@ -132,16 +151,20 @@ export class AssetLoader {
         else if (ext === "stl") loader = new THREE.STLLoader();
         else return;
 
-        console.log(`Comfy3D: Attempting load from ${type}:`, url);
+        console.log(`Comfy3D: Attempting load from ${type}: ${url}`);
 
         const onLoaded = (result) => {
-            console.log(`Comfy3D: Successfully loaded asset from ${type}:`, path);
+            console.log(`Comfy3D: Successfully loaded asset from ${type}: ${path}`);
             let model = result.scene || result;
             if (ext === "stl" && result.isBufferGeometry) {
                 model = new THREE.Mesh(result, new THREE.MeshStandardMaterial({ color: 0xcccccc }));
             }
+            this._ensureValidMaterials(model);
+
+            const fullRelativePath = (subfolder && subfolder !== "/") ? (subfolder.endsWith("/") ? subfolder + filename : subfolder + "/" + filename) : filename;
+            
             model.name = filename;
-            model.userData.filename = filename;
+            model.userData.filename = fullRelativePath;
             model.userData.type = type;
             this.addAsset(model);
             this.frameScene(model);

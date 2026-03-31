@@ -6,13 +6,11 @@
  */
 
 export class BrushPanel {
-    /**
-     * @param {HTMLElement} canvasArea
-     * @param {object} viewport - ComfyUI node instance (holds brush* properties).
-     */
-    constructor(canvasArea, viewport) {
-        this.canvasArea = canvasArea;
-        this.viewport = viewport;
+
+    constructor(THREE, deps) {
+        this.THREE = THREE;
+        Object.assign(this, deps);
+        this.canvasArea = deps.container;
         this._build();
     }
 

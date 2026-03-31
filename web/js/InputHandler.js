@@ -43,9 +43,8 @@ export class InputHandler {
         this.mouse = new THREE.Vector2();
         this.selectionStartLocal = new THREE.Vector2();
         this.selectionStartScreen = new THREE.Vector2();
-        this.mouseDownOnCanvas = false;
-        this.mouseInCanvas = false;
         this.isSelecting = false;
+        this.screenMouse = { x: 0, y: 0 };
 
         // Expose mouse ref to TransformManager for modal start
         this.transformManager.setMouseRef(this.mouse);
@@ -395,6 +394,7 @@ export class InputHandler {
         }
 
         this.mouseDownOnCanvas = false;
+        this.raycaster.firstHitOnly = false; // Reset BVH-specific optimization
         this.triggerUpdate();
     }
 
@@ -412,6 +412,8 @@ export class InputHandler {
 
         this.mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
         this.mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+        this.screenMouse.x = e.clientX;
+        this.screenMouse.y = e.clientY;
 
         if (vp.modalTransform.active) {
             const mt = vp.modalTransform;
@@ -685,7 +687,111 @@ export class InputHandler {
         if (key === "b" && !isCtrl && !isAlt) { const btn = this.toolbar?.toolbarBtns?.["brush"]; if (btn) btn.click(); }
         if (key === "v" && !isCtrl && !isAlt) { const btn = this.toolbar?.toolbarBtns?.["split"]; if (btn) btn.click(); }
         if (key === "j" && !isCtrl && !isAlt) { if (this._segPanel) this._segPanel.joinSelectedMeshes(); e.preventDefault(); }
-        if (key === "p" && !isCtrl && !isAlt) { if (this._segPanel) this._segPanel.separateMesh(); e.preventDefault(); }
+        if (key === "p" && !isCtrl && !isAlt) { this._showSplitMenu(); e.preventDefault(); }
+    }
+
+    _showSplitMenu() {
+        if (document.getElementById("comfy3d-split-menu")) return;
+
+        const menu = document.createElement("div");
+        menu.id = "comfy3d-split-menu";
+
+        // Clamp position so menu doesn't overflow viewport
+        Object.assign(menu.style, {
+            position: "absolute",
+            left: this.screenMouse.x + "px",
+            top: this.screenMouse.y + "px",
+            backgroundColor: "rgba(18, 18, 18, 0.8)",
+            backdropFilter: "blur(24px)",
+            WebkitBackdropFilter: "blur(24px)",
+            border: "1px solid rgba(255,255,255,0.06)",
+            borderRadius: "10px",
+            padding: "5px 0",
+            zIndex: "10000",
+            boxShadow: "0 12px 40px rgba(0,0,0,0.65)",
+            minWidth: "150px",
+            fontFamily: "system-ui, -apple-system, sans-serif",
+            overflow: "hidden",
+            color: "white"
+        });
+
+        // Header label
+        const title = document.createElement("div");
+        title.textContent = "SEPARATE";
+        Object.assign(title.style, {
+            padding: "8px 14px 6px",
+            fontSize: "9px",
+            fontWeight: "700",
+            letterSpacing: "0.12em",
+            color: "rgba(255,255,255,0.35)",
+            textTransform: "uppercase",
+            borderBottom: "1px solid rgba(255,255,255,0.06)",
+            marginBottom: "4px"
+        });
+        menu.appendChild(title);
+
+        const options = [
+            { 
+                label: "Selection",    
+                icon: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 9-9 9-9-9 9-9z" opacity="0.2"/><path d="M12 8l4 4-4 4-4-4 4-4z" fill="currentColor" stroke="none"/></svg>`, 
+                action: () => this._segPanel?.splitBySelection() 
+            },
+            { 
+                label: "By Material",  
+                icon: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8.66 5v10L12 22l-8.66-5V7L12 2z" opacity="0.2"/><path d="M12 2l8.66 5v10L12 22l-8.66-5V7L12 2z"/></svg>`, 
+                action: () => this._segPanel?.separateMesh() 
+            }
+        ];
+
+        options.forEach(opt => {
+            const btn = document.createElement("div");
+            Object.assign(btn.style, {
+                display: "flex",
+                alignItems: "center",
+                gap: "10px",
+                padding: "8px 14px",
+                cursor: "pointer",
+                fontSize: "12px",
+                fontWeight: "500",
+                color: "rgba(255,255,255,0.8)",
+                transition: "all 0.2s cubic-bezier(0.23, 1, 0.32, 1)",
+                userSelect: "none"
+            });
+            const iconEl = document.createElement("div");
+            iconEl.innerHTML = opt.icon;
+            Object.assign(iconEl.style, { display: "flex", alignItems: "center", opacity: "0.5", transition: "opacity 0.2s" });
+            btn.appendChild(iconEl);
+            const labelEl = document.createElement("span");
+            labelEl.textContent = opt.label;
+            btn.appendChild(labelEl);
+
+            btn.onmouseover = () => {
+                btn.style.background = "rgba(255,149,0,0.18)";
+                btn.style.color = "#ff9500";
+                iconEl.style.opacity = "1";
+            };
+            btn.onmouseout = () => {
+                btn.style.background = "transparent";
+                btn.style.color = "rgba(255,255,255,0.75)";
+                iconEl.style.opacity = "0.55";
+            };
+            btn.onclick = () => {
+                opt.action();
+                if (document.body.contains(menu)) document.body.removeChild(menu);
+                window.removeEventListener("mousedown", hideMenu);
+            };
+            menu.appendChild(btn);
+        });
+
+        const hideMenu = (me) => {
+            if (!menu.contains(me.target)) {
+                if (document.body.contains(menu)) document.body.removeChild(menu);
+                window.removeEventListener("mousedown", hideMenu);
+            }
+        };
+
+        document.body.appendChild(menu);
+        setTimeout(() => window.addEventListener("mousedown", hideMenu), 10);
     }
 
     // -----------------------------------------------------------------------

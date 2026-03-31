@@ -2,98 +2,26 @@
  * SelectionManager.js
  * Manages object selection state, sub-mesh selection (vertex/edge/face),
  * selection helper (bounding-box outline), and all highlight overlays.
- *
- * Extracted verbatim from web/3d_viewport.js lines 598–676, 1941–1951,
- * 2258–2330, 2332–2479, 2481–2551.
  */
 
 export class SelectionManager {
     /**
      * @param {object} THREE
-     * @param {THREE.Scene} scene
-     * @param {THREE.Camera} camera
-     * @param {object[]} assets - Live array of root scene objects (shared ref).
-     * @param {object} viewport - ComfyUI node instance (holds selectionMode etc.)
-     * @param {Function} triggerUpdate
+     * @param {object} deps
      */
-    constructor(THREE, scene, camera, assets, viewport, triggerUpdate) {
+    constructor(THREE, deps) {
         this.THREE = THREE;
-        this.scene = scene;
-        this.camera = camera;
-        this.assets = assets;
-        this.viewport = viewport;
-        this.triggerUpdate = triggerUpdate;
+        Object.assign(this, deps);
 
         this.selectedObjects = [];
         this.lastSelectedObject = null;
 
         // Sub-element selection: Map<meshUUID, {vertices: Set, edges: Set, faces: Set}>
-        viewport.selectedSubElements = new Map();
-
-        this._buildHelpers();
-    }
-
-    // -----------------------------------------------------------------------
-    // Build Three.js helper objects
-    // -----------------------------------------------------------------------
-    _buildHelpers() {
-        const THREE = this.THREE;
-        const scene = this.scene;
-
-        // Selection proxy (gizmo attach target)
-        this.selectionProxy = new THREE.Object3D();
-        scene.add(this.selectionProxy);
-
-        // Orange bounding-box outline
-        this.selectionHelper = new THREE.Group();
-        this.selectionWireframe = new THREE.LineSegments(
-            new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
-            new THREE.LineBasicMaterial({ color: 0xff4400, linewidth: 2 })
-        );
-        this.selectionHelper.add(this.selectionWireframe);
-        this.selectionHelper.visible = false;
-        scene.add(this.selectionHelper);
-
-        // Sub-mesh highlight overlays
-        this.vertexHighlight = new THREE.Points(
-            new THREE.BufferGeometry(),
-            new THREE.PointsMaterial({ color: 0xff9500, size: 6, sizeAttenuation: false, depthTest: false, transparent: true })
-        );
-        this.vertexHighlight.renderOrder = 999;
-        scene.add(this.vertexHighlight);
-
-        this.edgeHighlight = new THREE.LineSegments(
-            new THREE.BufferGeometry(),
-            new THREE.LineBasicMaterial({ color: 0xff9500, linewidth: 2, depthTest: false, transparent: true })
-        );
-        this.edgeHighlight.renderOrder = 998;
-        scene.add(this.edgeHighlight);
-
-        // Persistent background overlays (Blender look)
-        this.persistentVertexPoints = new THREE.Points(
-            new THREE.BufferGeometry(),
-            new THREE.PointsMaterial({ color: 0x000000, size: 5, sizeAttenuation: false, depthTest: true, transparent: true, opacity: 1.0 })
-        );
-        this.persistentVertexPoints.renderOrder = 991;
-        scene.add(this.persistentVertexPoints);
-
-        this.persistentWireframe = new THREE.LineSegments(
-            new THREE.BufferGeometry(),
-            new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 1, transparent: true, opacity: 0.5, depthTest: true })
-        );
-        this.persistentWireframe.renderOrder = 990;
-        scene.add(this.persistentWireframe);
-
-        this.faceHighlight = new THREE.Mesh(
-            new THREE.BufferGeometry(),
-            new THREE.MeshBasicMaterial({ color: 0xff9500, side: THREE.DoubleSide, transparent: true, opacity: 0.4, depthTest: false })
-        );
-        this.faceHighlight.renderOrder = 997;
-        scene.add(this.faceHighlight);
-
+        this.viewport.selectedSubElements = new Map();
         this._lastSubmeshUUID = null;
         this._lastSubmeshMode = null;
     }
+
 
     // -----------------------------------------------------------------------
     // Helpers bound by external managers (set after construction)
@@ -106,10 +34,10 @@ export class SelectionManager {
 
     /** Called by Outliner/Toolbar references. */
     setUICallbacks({ updateOutliner, updateOutlinerSelection, updateSelectionUI, updateToolbar, updateSubMeshHighlights }) {
-        this._updateOutliner = updateOutliner || (() => {});
-        this._updateOutlinerSelection = updateOutlinerSelection || (() => {});
-        this._updateSelectionUI = updateSelectionUI || (() => {});
-        this._updateToolbar = updateToolbar || (() => {});
+        this._updateOutliner = updateOutliner || (() => { });
+        this._updateOutlinerSelection = updateOutlinerSelection || (() => { });
+        this._updateSelectionUI = updateSelectionUI || (() => { });
+        this._updateToolbar = updateToolbar || (() => { });
         // Allow external override but default to our own
         if (updateSubMeshHighlights) this.updateSubMeshHighlights = updateSubMeshHighlights;
     }
@@ -162,12 +90,12 @@ export class SelectionManager {
     // getActiveMesh
     // -----------------------------------------------------------------------
     getActiveMesh() {
-        let activeMesh = null;
-        this.selectedObjects.forEach(obj => {
-            if (obj && obj.isMesh) { activeMesh = obj; return; }
-            if (obj) obj.traverse(child => { if (!activeMesh && child.isMesh) activeMesh = child; });
-        });
-        return activeMesh;
+        const sel = this.selectedObjects.filter(o => o && o.visible !== false)[0];
+        if (!sel) return null;
+        if (sel.isMesh) return sel;
+        let mesh = null;
+        sel.traverse(c => { if (!mesh && c.isMesh && c.visible !== false) mesh = c; });
+        return mesh;
     }
 
     /** Returns all pickable (visible, parented) assets. */
@@ -263,7 +191,7 @@ export class SelectionManager {
         // Auto-expand parents in outliner
         let anyExpanded = false;
         const expandedObjects = this._expandedObjects;
-        if (expandedObjects) {
+        if (expandedObjects instanceof Set) {
             this.selectedObjects.forEach(o => {
                 if (!o) return;
                 let curr = o.parent;
@@ -420,8 +348,8 @@ export class SelectionManager {
                     i2 = parseInt(edgeKey.substring(dashIdx + 1));
                 }
                 const o1 = i1 * 3, o2 = i2 * 3;
-                positions[i++] = meshData[o1];   positions[i++] = meshData[o1 + 1]; positions[i++] = meshData[o1 + 2];
-                positions[i++] = meshData[o2];   positions[i++] = meshData[o2 + 1]; positions[i++] = meshData[o2 + 2];
+                positions[i++] = meshData[o1]; positions[i++] = meshData[o1 + 1]; positions[i++] = meshData[o1 + 2];
+                positions[i++] = meshData[o2]; positions[i++] = meshData[o2 + 1]; positions[i++] = meshData[o2 + 2];
             });
             this.edgeHighlight.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
             this.edgeHighlight.geometry.attributes.position.needsUpdate = true;
@@ -446,9 +374,9 @@ export class SelectionManager {
                     i1 = faceIdx * 3; i2 = faceIdx * 3 + 1; i3 = faceIdx * 3 + 2;
                 }
                 const o1 = i1 * 3, o2 = i2 * 3, o3 = i3 * 3;
-                positions[i++] = meshData[o1];   positions[i++] = meshData[o1 + 1]; positions[i++] = meshData[o1 + 2];
-                positions[i++] = meshData[o2];   positions[i++] = meshData[o2 + 1]; positions[i++] = meshData[o2 + 2];
-                positions[i++] = meshData[o3];   positions[i++] = meshData[o3 + 1]; positions[i++] = meshData[o3 + 2];
+                positions[i++] = meshData[o1]; positions[i++] = meshData[o1 + 1]; positions[i++] = meshData[o1 + 2];
+                positions[i++] = meshData[o2]; positions[i++] = meshData[o2 + 1]; positions[i++] = meshData[o2 + 2];
+                positions[i++] = meshData[o3]; positions[i++] = meshData[o3 + 1]; positions[i++] = meshData[o3 + 2];
             });
             this.faceHighlight.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
             this.faceHighlight.geometry.attributes.position.needsUpdate = true;

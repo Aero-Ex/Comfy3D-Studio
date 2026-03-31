@@ -2,39 +2,22 @@
  * Outliner.js
  * Scene outliner panel: tree view of all assets, search, expand/collapse,
  * rename-in-place, visibility toggle, delete, drag-to-reposition header.
- *
- * Extracted verbatim from web/3d_viewport.js lines 1000–1347.
  */
 
 export class Outliner {
-    /**
-     * @param {object} deps
-     * @param {HTMLElement} deps.canvasArea
-     * @param {object[]} deps.assets                - Live array shared with scene.
-     * @param {THREE.Scene} deps.scene
-     * @param {SelectionManager} deps.selectionManager
-     * @param {CommandHistory} deps.history
-     * @param {object} deps.commandClasses           - { AssetCommand, RenameCommand }
-     * @param {Function} deps.triggerUpdate
-     */
-    constructor({ canvasArea, assets, scene, selectionManager, history, commandClasses, triggerUpdate }) {
-        this.canvasArea = canvasArea;
-        this.assets = assets;
-        this.scene = scene;
-        this.selMgr = selectionManager;
-        this.history = history;
-        this.AssetCommand = commandClasses.AssetCommand;
-        this.RenameCommand = commandClasses.RenameCommand;
-        this.triggerUpdate = triggerUpdate;
 
-        this.expandedObjects = new Set();
-        this.renamingId = null;
-        this.visibleUUIDs = [];
+    constructor(THREE, deps) {
+        this.THREE = THREE;
+        Object.assign(this, deps);
+        this.canvasArea = deps.container;
+        this.selMgr = deps.selectionManager;
         this.visible = true;
-
-        // External callback from SelectionManager
-        this.selMgr._expandedObjects = this.expandedObjects;
-
+        this.expandedObjects = new Set();
+        this.visibleUUIDs = [];
+        this.renamingId = null;
+        // Pull command classes from shared deps
+        this.RenameCommand = deps.commandClasses?.RenameCommand;
+        this.AssetCommand = deps.commandClasses?.AssetCommand;
         this._buildDOM();
     }
 
@@ -215,10 +198,10 @@ export class Outliner {
             // Icon
             const icon = document.createElement("div");
             const iconSvg = obj.isMesh
-                ? `<path d="M12 2l9 4.9V17L12 22l-9-4.9V7L12 2zm0 11.5l7.5-4.1M12 13.5l-7.5-4.1M12 13.5V21" />`
-                : `<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"></path>`;
-            icon.innerHTML = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" style="opacity: 0.5">${iconSvg}</svg>`;
-            Object.assign(icon.style, { marginRight: "6px", display: "flex" });
+                ? `<path d="M12 2l9 4.9V17L12 22l-9-4.9V7L12 2z" opacity="0.3"/><path d="M12 22V12m0 0l9-4.9M12 12L3 7.1" />`
+                : `<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" opacity="0.3"/><path d="M9 3l2 3h9a2 2 0 012 2v11a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5"></path>`;
+            icon.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">${iconSvg}</svg>`;
+            Object.assign(icon.style, { marginRight: "8px", display: "flex", alignItems: "center", color: obj.isMesh ? "#ff9500" : "rgba(255,255,255,0.5)" });
 
             // Label / Rename input
             const isRenaming = this.renamingId === obj.uuid;
@@ -270,9 +253,9 @@ export class Outliner {
 
             const eyeBtn = document.createElement("div");
             eyeBtn.innerHTML = isVisible
-                ? `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`
-                : `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>`;
-            eyeBtn.style.cssText = `opacity:${isVisible ? "0.7" : (isArchived ? "0.15" : "0.3")}; cursor:pointer;`;
+                ? `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`
+                : `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line></svg>`;
+            eyeBtn.style.cssText = `opacity:${isVisible ? "0.6" : (isArchived ? "0.15" : "0.25")}; cursor:pointer; display:flex; align-items:center; transition: opacity 0.2s;`;
             eyeBtn.title = isArchived ? "Archived (Click to Restore)" : "Toggle Visibility";
             eyeBtn.onclick = (e) => {
                 e.stopPropagation();
@@ -283,8 +266,8 @@ export class Outliner {
             };
 
             const delBtn = document.createElement("div");
-            delBtn.innerHTML = `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"></path></svg>`;
-            delBtn.style.cssText = "opacity:0.4; cursor:pointer;";
+            delBtn.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"></path></svg>`;
+            delBtn.style.cssText = "opacity:0.25; cursor:pointer; display:flex; align-items:center; transition: all 0.2s;";
             delBtn.onmouseenter = () => { delBtn.style.color = "#ff4444"; delBtn.style.opacity = "1"; };
             delBtn.onmouseleave = () => { delBtn.style.color = "inherit"; delBtn.style.opacity = "0.4"; };
             delBtn.onclick = (e) => {
@@ -313,13 +296,21 @@ export class Outliner {
             }
         };
 
-        this.assets.forEach(asset => renderObject(asset, 0));
+        this.assets.forEach(asset => {
+            let isDescendantOfAnotherAsset = false;
+            let p = asset.parent;
+            while (p) {
+                if (this.assets.includes(p)) { isDescendantOfAnotherAsset = true; break; }
+                p = p.parent;
+            }
+            if (!isDescendantOfAnotherAsset) renderObject(asset, 0);
+        });
         this.updateSelection();
         if (this._updateToolbar) this._updateToolbar();
     }
 
     // -----------------------------------------------------------------------
-    // updateSelection — restyle rows after selection changes [orig 1122–1135]
+    // updateSelection — restyle rows after selection changes
     // -----------------------------------------------------------------------
     updateSelection() {
         const rows = this.content.querySelectorAll(".outliner-row");

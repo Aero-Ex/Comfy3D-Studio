@@ -2,37 +2,19 @@
  * SegmentationPanel.js
  * Floating segmentation/split panel: BY MATERIAL split, JOIN SELECTED merge,
  * quantization slider, and EXIT button.
- *
- * Extracted verbatim from web/3d_viewport.js lines 725–912.
  */
 
 export class SegmentationPanel {
     /**
+     * @param {object} THREE
      * @param {object} deps
-     * @param {HTMLElement} deps.canvasArea
-     * @param {object} deps.viewport
-     * @param {object[]} deps.assets
-     * @param {THREE.Scene} deps.scene
-     * @param {SelectionManager} deps.selectionManager
-     * @param {CommandHistory} deps.history
-     * @param {object} deps.commandClasses          - { SeparateMeshCommand }
-     * @param {AssetLoader} deps.assetLoader        - provides loadAssetSilent(), addAsset()
-     * @param {ShadingManager} deps.shadingManager
-     * @param {Function} deps.toggleLoading
-     * @param {Function} deps.frameScene
-     * @param {Function} deps.toggleIsolate
-     * @param {Function} deps.getIsolatedObjects
-     * @param {Function} deps.triggerUpdate
-     * @param {Function} deps.updateOutliner
      */
-    constructor(deps) {
-        this.canvasArea = deps.canvasArea;
-        this.viewport = deps.viewport;
-        this.assets = deps.assets;
+    constructor(THREE, deps) {
+        this.THREE = THREE;
+        Object.assign(this, deps);
+        this.canvasArea = deps.container;
         this.scene = deps.scene;
-        this.selMgr = deps.selectionManager;
         this.history = deps.history;
-        this.SeparateMeshCommand = deps.commandClasses.SeparateMeshCommand;
         this.assetLoader = deps.assetLoader;
         this.shadingMgr = deps.shadingManager;
         this.toggleLoading = deps.toggleLoading;
@@ -49,30 +31,31 @@ export class SegmentationPanel {
         this.panel = document.createElement("div");
         Object.assign(this.panel.style, {
             position: "absolute", bottom: "72px", left: "50%",
-            transform: "translateX(-50%) translateY(20px)", display: "none", gap: "24px",
-            padding: "12px 24px", backgroundColor: "rgba(18, 18, 18, 0.7)",
-            backdropFilter: "blur(18px)", borderRadius: "14px",
-            border: "1px solid rgba(255,255,255,0.08)", zIndex: "110",
-            alignItems: "center", color: "white", fontSize: "11px",
-            boxShadow: "0 10px 40px rgba(0,0,0,0.6)",
-            transition: "all 0.3s cubic-bezier(0.23, 1, 0.32, 1)",
+            transform: "translateX(-50%) translateY(20px)", display: "none", gap: "28px",
+            padding: "16px 28px", backgroundColor: "rgba(18, 18, 18, 0.8)",
+            backdropFilter: "blur(24px)", WebkitBackdropFilter: "blur(24px)",
+            borderRadius: "16px", border: "1px solid rgba(255,255,255,0.06)",
+            zIndex: "110", alignItems: "center", color: "white",
+            fontFamily: "system-ui, -apple-system, sans-serif",
+            boxShadow: "0 12px 48px rgba(0,0,0,0.65)",
+            transition: "all 0.4s cubic-bezier(0.23, 1, 0.32, 1)",
             opacity: "0", pointerEvents: "none"
         });
         this.panel.innerHTML = `
-            <div style="display:flex; flex-direction:column; gap:6px;">
-                <div style="opacity:0.4; font-size:8px; font-weight:700; letter-spacing:0.1em; color:white; margin-bottom:2px;">MATERIAL SPLIT</div>
-                <div style="display:flex; align-items:center; gap:12px;">
-                     <input type="range" class="comfy3d-brush-slider" id="seg-quant-slider" min="1.0" max="64.0" step="1.0" value="16.0" style="width:100px;">
-                     <button class="comfy3d-segmentation-btn-primary" id="seg-mat-btn" style="padding:4px 12px; border-radius:6px; border:none; background:#ff9500; color:white; font-size:10px; cursor:pointer; font-weight:700; letter-spacing:0.05em;">BY MATERIAL</button>
+            <div style="display:flex; flex-direction:column; gap:8px;">
+                <div style="opacity:0.35; font-size:9px; font-weight:700; letter-spacing:0.12em; color:white; margin-bottom:2px; text-transform:uppercase;">MATERIAL SPLIT</div>
+                <div style="display:flex; align-items:center; gap:14px;">
+                     <input type="range" class="comfy3d-brush-slider" id="seg-quant-slider" min="1.0" max="64.0" step="1.0" value="16.0" style="width:110px;">
+                     <button class="comfy3d-segmentation-btn-primary" id="seg-mat-btn" style="padding:6px 14px; border-radius:8px; border:none; background:#ff9500; color:white; font-size:11px; cursor:pointer; font-weight:700; letter-spacing:0.04em; transition:transform 0.1s;">BY MATERIAL</button>
                 </div>
             </div>
-            <div style="width:1px; height:24px; background:rgba(255,255,255,0.1);"></div>
-            <div style="display:flex; flex-direction:column; gap:6px; align-items:center;">
-                <div style="opacity:0.4; font-size:8px; font-weight:700; letter-spacing:0.1em; color:white; margin-bottom:2px;">MERGE</div>
-                <button class="comfy3d-segmentation-btn-secondary" id="seg-join-btn" style="padding:4px 12px; border-radius:6px; border:1px solid rgba(255,255,255,0.1); background:none; color:white; font-size:10px; cursor:pointer; font-weight:700; letter-spacing:0.05em;">JOIN SELECTED</button>
+            <div style="width:1px; height:28px; background:rgba(255,255,255,0.06);"></div>
+            <div style="display:flex; flex-direction:column; gap:8px; align-items:center;">
+                <div style="opacity:0.35; font-size:9px; font-weight:700; letter-spacing:0.12em; color:white; margin-bottom:2px; text-transform:uppercase;">MERGE</div>
+                <button class="comfy3d-segmentation-btn-secondary" id="seg-join-btn" style="padding:6px 14px; border-radius:8px; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.03); color:white; font-size:11px; cursor:pointer; font-weight:700; letter-spacing:0.04em; transition:all 0.2s;">JOIN SELECTED</button>
             </div>
-            <div style="width:1px; height:24px; background:rgba(255,255,255,0.1);"></div>
-            <button class="comfy3d-segmentation-btn-secondary" id="seg-cancel-btn" style="padding:4px 8px; border-radius:6px; border:none; background:none; color:rgba(255,255,255,0.4); font-size:10px; cursor:pointer; font-weight:700;">EXIT</button>
+            <div style="width:1px; height:28px; background:rgba(255,255,255,0.06);"></div>
+            <button class="comfy3d-segmentation-btn-secondary" id="seg-cancel-btn" style="padding:6px 10px; border-radius:8px; border:none; background:none; color:rgba(255,255,255,0.3); font-size:11px; cursor:pointer; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; transition:color 0.2s;">EXIT</button>
         `;
         this.canvasArea.appendChild(this.panel);
 
@@ -122,7 +105,7 @@ export class SegmentationPanel {
     async joinSelectedMeshes() {
         const selectedObjects = this.selMgr.selectedObjects;
         const entriesMap = new Map();
-        const meshes = selectedObjects.filter(o => o.isMesh);
+        const meshes = selectedObjects.filter(o => o.isMesh && o.visible !== false);
 
         selectedObjects.forEach(obj => {
             let current = obj;
@@ -187,12 +170,12 @@ export class SegmentationPanel {
                 this.scene.add(finalObject);
             }
 
-            const cmd = new this.SeparateMeshCommand(objectsToRemove, [finalObject], this.assets, this.scene);
+            const cmd = new this.commandClasses.SeparateMeshCommand(objectsToRemove, [finalObject], this.assets, this.scene);
             cmd.redo();
             this.history.push(cmd);
 
             this.selMgr.selectedObjects = [finalObject];
-            this.updateOutliner();
+            this.updateOutliner?.();
             this.frameScene(finalObject);
             console.log("Comfy3D: Merged into " + result.filename);
         } catch (e) {
@@ -208,7 +191,7 @@ export class SegmentationPanel {
     // -----------------------------------------------------------------------
     async separateMesh(options = { quantization: 6.0 }) {
         const selectedObjects = this.selMgr.selectedObjects;
-        const targets = selectedObjects.filter(o => o.isMesh || (o.children && o.children.some(c => c.isMesh)));
+        const targets = selectedObjects.filter(o => ((o.isMesh || (o.children && o.children.some(c => c.isMesh))) && o.visible !== false));
         if (targets.length === 0) {
             console.warn("Comfy3D: No meshes selected for separation.");
             return;
@@ -247,6 +230,11 @@ export class SegmentationPanel {
                 model.name = filename.split("/").pop().replace(".glb", "_Split");
                 model.userData.filename = result.filename;
                 model.userData.type = result.type;
+                
+                model.position.copy(root.position);
+                model.quaternion.copy(root.quaternion);
+                model.scale.copy(root.scale);
+                model.updateMatrixWorld(true);
                 model.traverse(c => {
                     if (c.isMesh) {
                         this.shadingMgr.updateMeshShading(c);
@@ -258,11 +246,11 @@ export class SegmentationPanel {
             }
 
             if (newModels.length > 0) {
-                const cmd = new this.SeparateMeshCommand(originalRoots, newModels, this.assets, this.scene);
+                const cmd = new this.commandClasses.SeparateMeshCommand(originalRoots, newModels, this.assets, this.scene);
                 cmd.redo();
                 this.history.push(cmd);
                 this.selMgr.selectedObjects = [...newModels];
-                this.updateOutliner();
+                this.updateOutliner?.();
                 this.frameScene(newModels[0]);
             }
         } catch (e) {
@@ -282,5 +270,80 @@ export class SegmentationPanel {
     /** inject updateToolbar callback for toggle() */
     setUpdateToolbarCallback(fn) {
         this._updateToolbar = fn;
+    }
+
+    // -----------------------------------------------------------------------
+    // splitBySelection
+    // -----------------------------------------------------------------------
+    async splitBySelection() {
+        const activeMesh = this.selMgr.getActiveMesh();
+        if (!activeMesh) return alert("Select a mesh first.");
+
+        const sub = this.viewport.selectedSubElements.get(activeMesh.uuid);
+        if (!sub || (sub.vertices.size === 0 && sub.faces.size === 0)) {
+            return alert("Select some vertices or faces to split first (use keys 1 or 3).");
+        }
+
+        let root = activeMesh;
+        while (root.parent && !this.assets.includes(root)) root = root.parent;
+        const filename = root.userData.filename;
+        const folderType = root.userData.type || "output";
+        if (!filename) return alert("Selected mesh has no associated file.");
+
+        try {
+            this.toggleLoading(true);
+            console.log(`Comfy3D: Splitting selection from ${filename}...`);
+
+            const payload = {
+                filename,
+                type: folderType,
+                face_indices: sub.faces.size > 0 ? Array.from(sub.faces) : null,
+                vertex_indices: sub.vertices.size > 0 ? Array.from(sub.vertices) : null
+            };
+
+            const response = await fetch("/comfy3d/split_selection", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            });
+            const result = await response.json();
+            if (result.error) throw new Error(result.error);
+
+            // Load both results
+            const reducedModel = await this.assetLoader.loadAssetSilent(result.reduced.filename, result.reduced.type);
+            const selectionModel = await this.assetLoader.loadAssetSilent(result.selection.filename, result.selection.type);
+
+            reducedModel.name = activeMesh.name + "_Base";
+            selectionModel.name = activeMesh.name + "_Part";
+
+            reducedModel.position.copy(root.position);
+            reducedModel.quaternion.copy(root.quaternion);
+            reducedModel.scale.copy(root.scale);
+            reducedModel.updateMatrixWorld(true);
+
+            selectionModel.position.copy(root.position);
+            selectionModel.quaternion.copy(root.quaternion);
+            selectionModel.scale.copy(root.scale);
+            selectionModel.updateMatrixWorld(true);
+
+            // Re-apply shading
+            reducedModel.traverse(c => { if (c.isMesh) this.shadingMgr.updateMeshShading(c); });
+            selectionModel.traverse(c => { if (c.isMesh) this.shadingMgr.updateMeshShading(c); });
+
+            const cmd = new this.commandClasses.SeparateMeshCommand([root], [reducedModel, selectionModel], this.assets, this.scene);
+            cmd.redo();
+            this.history.push(cmd);
+
+            this.selMgr.selectedObjects = [selectionModel];
+            this.viewport.selectedSubElements.delete(activeMesh.uuid);
+            this.updateOutliner?.();
+            this.frameScene(selectionModel);
+
+        } catch (e) {
+            console.error("Comfy3D: Split selection failed:", e);
+            alert("Split Selection Failed: " + e.message);
+        } finally {
+            this.toggleLoading(false);
+        }
     }
 }
